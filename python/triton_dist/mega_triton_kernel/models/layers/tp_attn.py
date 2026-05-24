@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from ..paged_kv_cache import PagedKVCache
+from ...tasks.utils import cdiv
 
 try:
     import shmem as ash
@@ -112,9 +113,24 @@ class TPAttnBuilder:
         else:
             o_proj_out = torch.zeros((num_tokens, hidden_size), dtype=x.dtype, device=x.device)
         
-        sms_per_batch = max(1, self._builder.NUM_SMS // (num_tokens * (self.kv_size // self.head_dim)))
-        self.KV_SPLITS = sms_per_batch
-        print(f"KV_SPLITS = {self.KV_SPLITS}")
+        # KV_SPLITS: 控制 flash decode split 的 KV 分片数
+        # 目标1: 每片处理约 48 个 KV page (~3K tokens)，控制单 tile 计算量
+        # 目标2: 总 tile 数 >= NUM_SMS * 3，保证 20 个 AICore 平均有 3+ 个 tile
+        # 上限: 8，避免 partial_out/lse 过大和 combine 开销
+        num_kv_heads = self.kv_size // self.head_dim
+        num_q_heads_per_group = self.q_head_num // num_kv_heads
+        BLOCK_H = 4
+        head_groups = cdiv(self.q_head_num, min(num_q_heads_per_group, BLOCK_H))
+        base_tiles = num_tokens * head_groups
+        total_pages = (self.max_length + kv_cache.PAGE_SIZE - 1) // kv_cache.PAGE_SIZE
+        target_pages_per_split = 48
+        kv_splits_for_work = max(1, cdiv(total_pages, target_pages_per_split))
+        target_tiles_per_sm = 3
+        min_tiles = self._builder.NUM_SMS * target_tiles_per_sm
+        kv_splits_for_dist = max(1, cdiv(min_tiles, base_tiles))
+        self.KV_SPLITS = max(kv_splits_for_work, kv_splits_for_dist)
+        self.KV_SPLITS = min(self.KV_SPLITS, 8)
+        print(f"KV_SPLITS = {self.KV_SPLITS} (base_tiles={base_tiles})")
         self._builder.make_qkv_proj(x, self.wqkv, qkv_proj_out)
         # return qkv_proj_out.reshape(batch_size, q_len, hidden_size), qkv_proj_out
         qkv_proj_out_bsnh = qkv_proj_out.reshape(batch_size, q_len, -1, self.head_dim)
