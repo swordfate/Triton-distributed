@@ -114,6 +114,7 @@ def rmsnorm_rope_update_kv_cache_task_compute(
 
     block_entry_id = tl.load(block_table_ptr + batch_idx * stride_table_bs + page_id, mask=batch_mask, other=0)
     cache_token_idx = block_entry_id * PAGE_SIZE + page_off
+    cache_token_idx = cache_token_idx.to(tl.int64)  # 避免大batch下32位地址偏移溢出
     
     # set value_cache in tile which calculate key
     if idx_1 >= NUM_Q_HEADS:

@@ -100,7 +100,7 @@ def attn_gqa_fwd_batch_decode_split_kv_task_para(
         current_token_indices = logical_block_idx * PAGE_SIZE + offs_page
         mask_valid_tokens = current_token_indices < cur_kv_seq_len
 
-        physical_block_id = tl.load(block_table_ptr + bid * stride_table_bs + logical_block_idx)
+        physical_block_id = tl.load(block_table_ptr + bid * stride_table_bs + logical_block_idx).to(tl.int64)  # 避免大batch下32位地址偏移溢出
         kv_off = physical_block_id * (PAGE_SIZE * stride_cache_bs) + kv_hid * stride_cache_h + offs_in_page
         k_tile = tl.load(k_cache_ptr + kv_off)
         v_tile = tl.load(v_cache_ptr + kv_off)
