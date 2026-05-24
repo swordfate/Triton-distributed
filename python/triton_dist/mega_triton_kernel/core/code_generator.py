@@ -1,13 +1,29 @@
 from typing import List, Dict, Tuple
 import textwrap
+from dataclasses import dataclass
 from .registry import registry
 from .task_base import TaskBase, CodeGenKey
 
 
-def make_mega_kernel_src(tasks_dispatch_code: str, enalbe_profiling: bool, task_types_and_str: Dict[int, str], target_hw: str) -> str:
+@dataclass
+class CodeGenOptions:
+    """代码生成选项, 对齐 main 分支"""
+    enable_profiling: bool = False
+    enable_runtime_scheduler: bool = False
+    enable_task_prefetch: bool = False
+    target_hw: str = 'gpu'
+
+
+def make_mega_kernel_src(tasks_dispatch_code: str, codegen_options: CodeGenOptions,
+                         task_types_and_str: Dict[int, str]) -> str:
     """
         max_task_type: profiling use only
     """
+    enalbe_profiling = codegen_options.enable_profiling
+    target_hw = codegen_options.target_hw
+    enable_runtime_scheduler = codegen_options.enable_runtime_scheduler
+    enable_task_prefetch = codegen_options.enable_task_prefetch
+
     max_task_type = 0
     for k, v in task_types_and_str.items():
         max_task_type = max(max_task_type, k)
@@ -67,7 +83,7 @@ def MEGA_TRITON_KERNEL(
         tile_id_or_start = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TILE_ID_OR_START_OFFSET).to(tl.int32)
         depend_entry_start = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + DEPEND_ENTRY_START_OFFSET).to(tl.int32)
         depend_entry_end = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + DEPEND_ENTRY_END_OFFSET).to(tl.int32)
-        
+
         io_tensors_ptr = work_queues + i * offset + sm_id * INT_PER_TASK + IO_TENSORS_OFFSET
         task_base_info = TaskBaseInfo(io_tensors_ptr, layer_id, task_id, tile_id_or_start, depend_entry_start, depend_entry_end, MAX_NUM_TENSOR_DIMS)
 
@@ -86,6 +102,37 @@ def MEGA_TRITON_KERNEL(
         for k,v in task_types_and_str.items():
             if v in ['QKVProjTask', 'PagedGQAFwdTask', 'OProjTask', 'MLPFC1Task', 'MLPFC2Task', 'LinearTask', 'AttnSplitTask']:
                 aic.append(k)
+
+        # ---- 按调度模式分叉: 静态调度 vs 动态调度 ----
+        if enable_runtime_scheduler:
+            # ===================================================================
+            # 动态调度模式: 所有 task 放入一个全局平面队列 (num_sms=1),
+            # 每个 SM 通过原子操作竞争获取下一个 task, 空闲 SM 自动承接更多工作.
+            # 参考 main 分支 GPU 动态调度设计, 适配 Ascend NPU.
+            # ===================================================================
+            work_queue_start_param = "work_queue_start, # [1,] int32 全局原子计数器"
+            # 动态调度: 每个 SM 先原子抢第一个 task
+            task_fetch_body = _make_npu_dynamic_scheduler_body(
+                aic=aic,
+                enalbe_profiling=enalbe_profiling,
+                tasks_dispatch_code=tasks_dispatch_code,
+                scoreboard_wait_deps_task_type=scoreboard_wait_deps_task_type,
+                load_before_wait_type=load_before_wait_type,
+                enable_task_prefetch=enable_task_prefetch,
+            )
+        else:
+            # ===================================================================
+            # 静态调度模式: 每个 SM 有固定的 per-SM 工作队列 (round-robin 预分配)
+            # ===================================================================
+            work_queue_start_param = ""
+            task_fetch_body = _make_npu_static_scheduler_body(
+                aic=aic,
+                enalbe_profiling=enalbe_profiling,
+                tasks_dispatch_code=tasks_dispatch_code,
+                scoreboard_wait_deps_task_type=scoreboard_wait_deps_task_type,
+                load_before_wait_type=load_before_wait_type,
+            )
+
         src = f"""
 import triton
 import triton.language as tl
@@ -104,6 +151,7 @@ tl.extract_slice = al.extract_slice
 @triton.jit
 def MEGA_TRITON_KERNEL(
     {"profiler_buf, # ensor<uint64>" if enalbe_profiling else ""}
+    {work_queue_start_param}
     work_queues, # [MAX_INS, NUM_SMS, INS], int32
     num_tasks_per_wq, #[num_sms,]
     scoreboard_ptr,
@@ -127,8 +175,6 @@ def MEGA_TRITON_KERNEL(
     WARP_SIZE: tl.constexpr = 32
     NUM_THREADS: tl.constexpr = num_warps * WARP_SIZE
     sm_id = tl.program_id(axis=0)
-    num_tasks = tl.load(num_tasks_per_wq + sm_id)
-    offset = INT_PER_TASK * NUM_SMS
 
     TASK_TYPE_OFFSET = 0
     LAYER_ID_OFFSET = 1
@@ -138,8 +184,28 @@ def MEGA_TRITON_KERNEL(
     DEPEND_ENTRY_END_OFFSET = 5
     IO_TENSORS_OFFSET = 6
 
+{textwrap.indent(task_fetch_body.strip(), '    ')}
+"""
+    return src, task_types_and_str
+
+
+def _make_npu_static_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
+                                     scoreboard_wait_deps_task_type, load_before_wait_type):
+    """生成 NPU 静态调度 (per-SM queue) 的 task 循环体."""
+    prof_load_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_load_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_wait_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_wait_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_task_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_task_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+
+    aic_cond = ' or '.join([f'(task_type=={x})' for x in aic])
+
+    body = f"""    num_tasks = tl.load(num_tasks_per_wq + sm_id)
+    offset = INT_PER_TASK * NUM_SMS
+
     for i in range(num_tasks):
-        {f"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+{prof_load_begin}\
         task_type = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TASK_TYPE_OFFSET).to(tl.int32)
         layer_id = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + LAYER_ID_OFFSET).to(tl.int32)
         task_id = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TASK_ID_OFFSET).to(tl.int32)
@@ -148,24 +214,21 @@ def MEGA_TRITON_KERNEL(
         depend_entry_end = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + DEPEND_ENTRY_END_OFFSET).to(tl.int32)
         io_tensors_ptr = work_queues + i * offset + sm_id * INT_PER_TASK + IO_TENSORS_OFFSET
 
-        {f"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={load_before_wait_type}, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
-
-        {f"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+{prof_load_end}\
+{prof_wait_begin}\
         with al.scope(core_mode="vector"):
-            # 3. 在主循环中调用扁平化的 wait_deps 函数
             scoreboard_wait_deps_flat(
-                scoreboard_ptr, 
+                scoreboard_ptr,
                 task_deps_ptr,
-                depend_entry_start, 
+                depend_entry_start,
                 depend_entry_end,
                 INT_PER_DEPS=INT_PER_DEPS,
                 TILE_READY_SIGNAL=TILE_READY_SIGNAL,
                 debug_counts=debug_counts,
             )
-        
 
         # 访存保序
-        if (task_type=={aic[0]} or (task_type=={aic[1]} or (task_type=={aic[2]} or (task_type=={aic[3]} or (task_type=={aic[4]} or task_type=={aic[5]}))))) and (depend_entry_end > depend_entry_start):
+        if ({aic_cond}) and (depend_entry_end > depend_entry_start):
             with al.scope(core_mode="vector"):
                 tl.sync_block_set('vector', 'cube', 5)
             with al.scope(core_mode="cube"):
@@ -182,13 +245,114 @@ def MEGA_TRITON_KERNEL(
                     pack=1,
                 )
 
-        {f"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+{prof_wait_end}\
         #### run task ####
-        {"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+{prof_task_begin}\
 {textwrap.indent(tasks_dispatch_code.strip(), '        ')}
-        {"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
-"""    
-    return src, task_types_and_str
+{prof_task_end}\
+"""
+    return body
+
+
+def _make_npu_dynamic_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
+                                      scoreboard_wait_deps_task_type, load_before_wait_type,
+                                      enable_task_prefetch):
+    """生成 NPU 动态调度 (global flat queue + 原子竞争) 的 task 循环体.
+
+    参考 main 分支 GPU 动态调度设计:
+    - 所有 task 放入一个全局平面队列 (enque_tasks 时 num_sms=1)
+    - 每个 SM 通过 tl.atomic_add 原子抢下一个 task 索引
+    - work_queue_start 是全局原子计数器 (单元素 int32 tensor)
+    - 空闲 SM 自动承接更多工作, 消除静态预分配导致的负载不均
+
+    注: 动态调度依赖 Ascend NPU 硬件支持 tl.atomic_add 跨 SM 原子操作.
+        如不可用, 需通过软件方法 (如 scoreboard 锁) 实现类似效果.
+    """
+    aic_cond = ' or '.join([f'(task_type=={x})' for x in aic])
+
+    prof_load_begin = f'prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n        ' if enalbe_profiling else ''
+    prof_load_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_wait_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_wait_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_task_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_task_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+
+    # 从全局平面队列加载单条 task 元数据 + 等待依赖 + 执行 + 释放
+    task_exec_block = f"""\
+{prof_load_begin}\
+        task_type = tl.load(work_queues + cur_task_idx * INT_PER_TASK + TASK_TYPE_OFFSET).to(tl.int32)
+        layer_id = tl.load(work_queues + cur_task_idx * INT_PER_TASK + LAYER_ID_OFFSET).to(tl.int32)
+        task_id = tl.load(work_queues + cur_task_idx * INT_PER_TASK + TASK_ID_OFFSET).to(tl.int32)
+        tile_id_or_start = tl.load(work_queues + cur_task_idx * INT_PER_TASK + TILE_ID_OR_START_OFFSET).to(tl.int32)
+        depend_entry_start = tl.load(work_queues + cur_task_idx * INT_PER_TASK + DEPEND_ENTRY_START_OFFSET).to(tl.int32)
+        depend_entry_end = tl.load(work_queues + cur_task_idx * INT_PER_TASK + DEPEND_ENTRY_END_OFFSET).to(tl.int32)
+        io_tensors_ptr = work_queues + cur_task_idx * INT_PER_TASK + IO_TENSORS_OFFSET
+
+{prof_load_end}\
+{prof_wait_begin}\
+        with al.scope(core_mode="vector"):
+            scoreboard_wait_deps_flat(
+                scoreboard_ptr,
+                task_deps_ptr,
+                depend_entry_start,
+                depend_entry_end,
+                INT_PER_DEPS=INT_PER_DEPS,
+                TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+                debug_counts=debug_counts,
+            )
+
+        # 访存保序
+        if ({aic_cond}) and (depend_entry_end > depend_entry_start):
+            with al.scope(core_mode="vector"):
+                tl.sync_block_set('vector', 'cube', 5)
+            with al.scope(core_mode="cube"):
+                tl.sync_block_wait('vector', 'cube', 5)
+        else:
+            with al.scope(core_mode="vector"):
+                dummy = tl.arange(0, 1)
+                tl.inline_asm_elementwise(
+                    asm="BAR.ALL",
+                    constraints="=l,0",
+                    args=[dummy],
+                    dtype=tl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+
+{prof_wait_end}\
+        #### run task ####
+{prof_task_begin}\
+{textwrap.indent(tasks_dispatch_code.strip(), '        ')}
+{prof_task_end}\
+"""
+
+    if enable_task_prefetch:
+        # 预取下一个 task: 在执行当前 task 前先原子抢下一个, 隐藏取指延迟
+        body = f"""    num_total_tasks = tl.load(num_tasks_per_wq)  # 全局队列总 task 数
+    cur_task_idx = tl.atomic_add(work_queue_start, 1)
+    if cur_task_idx >= num_total_tasks:
+        return
+    # 第一个 task: 加载 + 执行
+{textwrap.indent(task_exec_block, '    ')}
+
+    while True:
+        cur_task_idx = tl.atomic_add(work_queue_start, 1)
+        if cur_task_idx >= num_total_tasks:
+            break
+{textwrap.indent(task_exec_block, '        ')}
+"""
+    else:
+        # 无预取: while 循环内原子抢 task
+        body = f"""    num_total_tasks = tl.load(num_tasks_per_wq)  # 全局队列总 task 数
+    cur_task_idx = tl.atomic_add(work_queue_start, 1)
+    if cur_task_idx >= num_total_tasks:
+        return
+
+    while cur_task_idx < num_total_tasks:
+{textwrap.indent(task_exec_block, '        ')}
+        cur_task_idx = tl.atomic_add(work_queue_start, 1)
+"""
+    return body
 
 
 class CodeGenerator:
@@ -252,10 +416,11 @@ class CodeGenerator:
 {textwrap.indent(all_codes.strip(), '    ')}
 """
 
-    def generate_code(self, tasks: List['TaskBase'], enable_profiling=False, target_hw='gpu') -> str:
+    def generate_code(self, tasks: List['TaskBase'], codegen_options: CodeGenOptions) -> str:
         self._condition_and_codes.clear()
         self._task_types_and_str.clear()
 
+        target_hw = codegen_options.target_hw
         for task in tasks:
             key = task.get_codegen_key(task.layer_id, task.task_id)
             assert isinstance(key, CodeGenKey)
@@ -274,6 +439,6 @@ class CodeGenerator:
             tasks_dispatch_code += self.generate_for_each_task_type(key_and_tasks_list, is_first_branch)
             is_first_branch = False
 
-        mege_kernel_src, self._task_types_and_str = make_mega_kernel_src(tasks_dispatch_code, enable_profiling,
-                                                                         self._task_types_and_str, target_hw)
+        mege_kernel_src, self._task_types_and_str = make_mega_kernel_src(tasks_dispatch_code, codegen_options,
+                                                                         self._task_types_and_str)
         return mege_kernel_src, self._task_types_and_str

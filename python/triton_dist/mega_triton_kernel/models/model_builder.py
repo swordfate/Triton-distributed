@@ -5,7 +5,7 @@ import os
 # import nvshmem
 # import nvshmem.core
 
-from ..core.code_generator import CodeGenerator
+from ..core.code_generator import CodeGenerator, CodeGenOptions
 from ..core.registry import registry
 from ..core.task_base import TaskBase, DeviceProp, TaskDependency, TaskIDManager, MAX_NUM_TENSOR_DIMS
 from ..core.builder import TaskBuilderBase
@@ -64,7 +64,7 @@ def check_alignment(tensors):
 class ModelBuilder:
 
     def __init__(self, rank=0, world_size=1, local_world_size=1, num_warps=4, enable_profiling=False,
-                 enable_dep_opt=True, target_hw='gpu'):
+                 enable_dep_opt=True, target_hw='gpu', enable_runtime_scheduler=False, enable_task_prefetch=False):
         self.reset()
         self._registry = registry
         self._code_generator = CodeGenerator()
@@ -101,6 +101,8 @@ class ModelBuilder:
         self.logger = logger
         self._enable_profiling = enable_profiling
         self._enable_dep_opt = enable_dep_opt
+        self._enable_runtime_scheduler = enable_runtime_scheduler
+        self._enable_task_prefetch = enable_task_prefetch
         self.target_hw = target_hw
         self.task_types_to_str = None
         self._graph = Graph()
@@ -822,15 +824,27 @@ class ModelBuilder:
         else:
             megakernel_tasks = self.megakernel_tasks
         print(f'total dep tasks num after _graph.to_tasks() = {sum([len(t.dependency) for t in self.megakernel_tasks])}')
+        # 动态调度: num_sms=1 将所有 task 放入一个全局平面队列
+        if self._enable_runtime_scheduler:
+            num_sms = 1
+        else:
+            num_sms = self.device_prop.NUM_SMS
         self.wq_tensor, self.num_tasks_tensor, self.scoreboard, self.task_deps_tensor = enque_tasks(
-            self.device_prop.NUM_SMS, megakernel_tasks, "round_robin")
+            num_sms, megakernel_tasks, "round_robin",
+            enable_dependency_opt=not self._enable_runtime_scheduler)
         # scbd中的每行cacheline对齐
         self.MAX_NUM_TILES_PER_OP = (self.MAX_NUM_TILES_PER_OP + 127) // 128 * 128
         self.scoreboard = torch.zeros((self.max_layer_id + 1, self.max_task_id + 1, self.MAX_NUM_TILES_PER_OP),
                                       dtype=torch.int32, device=torch.cuda.current_device())
         print(f'task_deps_tensor.shape = {self.task_deps_tensor.shape}')
         print(f'scoreboard.shape = {self.scoreboard.shape}')
-        src, task_types_to_str = self._code_generator.generate_code(self.megakernel_tasks, self._enable_profiling, self.target_hw)
+        codegen_options = CodeGenOptions(
+            enable_profiling=self._enable_profiling,
+            enable_runtime_scheduler=self._enable_runtime_scheduler,
+            enable_task_prefetch=self._enable_task_prefetch,
+            target_hw=self.target_hw,
+        )
+        src, task_types_to_str = self._code_generator.generate_code(self.megakernel_tasks, codegen_options)
         # task_types_to_str = {0: 'RMSNormTask', 1: 'QKVProjTask', 2: 'QKNormRopeUpdateKVCacheTask', 3: 'AttnSplitTask', 
         # 4: 'AttnCombineTask', 5: 'OProjTask', 9: 'AddTask', 6: 'MLPFC1Task', 7: 
         # 'SiLUMulUpTask', 8: 'MLPFC2Task', 10: 'LinearTask', 11: 'scoreboard_wait_deps', 12: 'task_decoding'}
@@ -867,23 +881,26 @@ class ModelBuilder:
         grid = lambda META: (self.device_prop.NUM_SMS, ) # NUM_SMS个线程块
         debug_counts = torch.zeros((self.max_layer_id + 1, self.max_task_id + 1, self.MAX_NUM_TILES_PER_OP),
                                       dtype=torch.int32, device=torch.cuda.current_device())
-        # # print(f'scoreboard before run magekernel: {self.scoreboard}')
-        # print(f'self.num_tasks_tensor = {self.num_tasks_tensor}')
-        # print(f'INT_PER_DEPS = {self.task_deps_tensor.shape[1]}')
-        # print(f'INT_PER_TASK = {self.wq_tensor.shape[2]}')
-        # print(f'MAX_TASK_ID = {self.scoreboard.shape[1]}')
-        # print(f'MAX_NUM_TILES_PER_OP = {self.scoreboard.shape[2]}')
-        # print(f'MAX_NUM_TENSOR_DIMS = {self._max_tensor_dim}')
-        # print(f'NUM_SMS = {self.device_prop.NUM_SMS}')
+        # 动态调度: 全局原子计数器, 每个 SM 通过 atomic_add 抢下一个 task
+        self._work_queue_start = torch.empty((1,), dtype=torch.int32, device=torch.cuda.current_device())
+        if self._enable_runtime_scheduler:
+            self._work_queue_start.fill_(0)
         if self._enable_profiling:
             assert self.profile_buf is not None
             reset_profiler_buffer(self.profile_buf)
-            self._gen_kernel[grid](
+            kernel_args = [
                 self.profile_buf,
+            ]
+            if self._enable_runtime_scheduler:
+                kernel_args.append(self._work_queue_start)
+            kernel_args += [
                 self.wq_tensor,
                 self.num_tasks_tensor,
                 self.scoreboard,
                 self.task_deps_tensor,
+            ]
+            self._gen_kernel[grid](
+                *kernel_args,
                 INT_PER_DEPS=self.task_deps_tensor.shape[1],
                 INT_PER_TASK=self.wq_tensor.shape[2],
                 MAX_TASK_ID=self.scoreboard.shape[1],
@@ -892,14 +909,19 @@ class ModelBuilder:
                 NUM_SMS=self.device_prop.NUM_SMS,
                 num_warps=self.num_warps,
                 debug_counts=debug_counts,
-                # sync_solver=False
             )
         else:
-            self._gen_kernel[grid](
+            kernel_args = []
+            if self._enable_runtime_scheduler:
+                kernel_args.append(self._work_queue_start)
+            kernel_args += [
                 self.wq_tensor,
                 self.num_tasks_tensor,
                 self.scoreboard,
                 self.task_deps_tensor,
+            ]
+            self._gen_kernel[grid](
+                *kernel_args,
                 INT_PER_DEPS=self.task_deps_tensor.shape[1],
                 INT_PER_TASK=self.wq_tensor.shape[2],
                 MAX_TASK_ID=self.scoreboard.shape[1],
@@ -908,7 +930,6 @@ class ModelBuilder:
                 NUM_SMS=self.device_prop.NUM_SMS,
                 num_warps=self.num_warps,
                 debug_counts=debug_counts,
-                # sync_solver=False
             )
         # print(f'scoreboard end run magekernel: {self.scoreboard}')
         # print(f'debug_counts end run magekernel: {debug_counts}')
