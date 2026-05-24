@@ -1,27 +1,3 @@
-################################################################################
-#
-# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files
-# (the "Software"), to deal in the Software without restriction,
-# including without limitation the rights to use, copy, modify, merge,
-# publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#
-################################################################################
 import math
 from typing import Tuple, List
 from .utils import cdiv
@@ -40,8 +16,8 @@ class AttnConfig(ConfigBase):
     BLOCK_HEAD_DIM: int = 128
     BLOCK_DPE: int = 0
     BLOCK_DV: int = 128
-    BLOCK_H: int = 16
-    NUM_KV_SPLITS: int = 32
+    BLOCK_H: int = 4
+    NUM_KV_SPLITS: int = 2
 
 
 @dataclass
@@ -66,34 +42,66 @@ def attn_config_factory(**kwargs) -> AttnConfig:
     return dataclasses.replace(AttnConfig(), **kwargs)
 
 
-def codegen_attn_split(task: AttnSplitTask) -> str:
+def codegen_attn_split(task: AttnSplitTask, target_hw: str) -> str:
     config: AttnConfig = task.config
     query, key_cache, v_cache, block_tables, kv_lens = task.io_tensors[0]
     partial_out, lse = task.io_tensors[1]
     NUM_Q_HEADS, Q_HEAD_DIM = query.shape[-2], query.shape[-1]
     PAGE_SIZE, NUM_KV_HEADS, V_HEAD_DIM = v_cache.shape[-3], v_cache.shape[-2], v_cache.shape[-1]
     MAX_NUM_BLOCKS_PER_SEQ = block_tables.shape[-1]
-
     code = f"""
-attn_gqa_fwd_batch_decode_split_kv_task_compute(
-    task_base_info, scoreboard, SM_SCALE={task.extra_params["sm_scale"]}, SOFT_CAP={task.extra_params["soft_cap"]},
+attn_gqa_fwd_batch_decode_split_kv_task_para(
+    tile_id_or_start=tile_id_or_start, MAX_NUM_TENSOR_DIMS=MAX_NUM_TENSOR_DIMS,
+    io_tensors_ptr=io_tensors_ptr,
+    SM_SCALE={task.extra_params["sm_scale"]}, SOFT_CAP={task.extra_params["soft_cap"]},
     NUM_Q_HEADS={NUM_Q_HEADS}, NUM_KV_HEADS={NUM_KV_HEADS}, Q_HEAD_DIM={Q_HEAD_DIM}, V_HEAD_DIM={V_HEAD_DIM}, PAGE_SIZE={PAGE_SIZE},
-    MAX_NUM_BLOCKS_PER_SEQ={MAX_NUM_BLOCKS_PER_SEQ}, BLOCK_N={config.BLOCK_N}, BLOCK_HEAD_DIM={config.BLOCK_HEAD_DIM},
-    BLOCK_DPE={config.BLOCK_DPE}, BLOCK_DV={config.BLOCK_DV}, BLOCK_H={config.BLOCK_H}, NUM_KV_SPLITS={config.NUM_KV_SPLITS}
+    MAX_NUM_BLOCKS_PER_SEQ={MAX_NUM_BLOCKS_PER_SEQ},
+    BLOCK_H={config.BLOCK_H}, NUM_KV_SPLITS={config.NUM_KV_SPLITS},
+    scoreboard_ptr=scoreboard_ptr,
+    layer_id=layer_id,
+    task_id=task_id,
+    TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+    MAX_TASK_ID=MAX_TASK_ID,
+    MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP,
 )
+# scoreboard_release_tile_flat(
+#     scoreboard_ptr=scoreboard_ptr, 
+#     layer_id=layer_id, 
+#     task_id=task_id,
+#     tile_id=tile_id_or_start,
+#     TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+#     MAX_TASK_ID=MAX_TASK_ID,
+#     MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP
+# )
 """
     return code
 
 
-def codegen_attn_combine(task: AttnSplitTask) -> str:
+def codegen_attn_combine(task: AttnSplitTask, target_hw: str) -> str:
     config: AttnConfig = task.config
     kv_lens, partial_out, lse = task.io_tensors[0]
     output = task.io_tensors[1][0]
     NUM_Q_HEADS, V_HEAD_DIM = output.shape[-2], output.shape[-1]
-    code = f"""
+    if target_hw == 'gpu':
+        code = f"""
 attn_gqa_fwd_batch_decode_combine_task_compute(
     task_base_info, scoreboard, NUM_Q_HEADS={NUM_Q_HEADS}, V_HEAD_DIM={V_HEAD_DIM}, BLOCK_DV={config.BLOCK_DV}, NUM_KV_SPLITS={config.NUM_KV_SPLITS}
 )
+"""
+    else:
+        code = f"""
+with al.scope(core_mode="vector"):
+    attn_gqa_fwd_batch_decode_combine_task_compute(
+                                                tile_id_or_start=tile_id_or_start, MAX_NUM_TENSOR_DIMS=MAX_NUM_TENSOR_DIMS,
+                                                io_tensors_ptr=io_tensors_ptr,
+                                                NUM_Q_HEADS={NUM_Q_HEADS}, V_HEAD_DIM={V_HEAD_DIM}, NUM_KV_SPLITS={config.NUM_KV_SPLITS},
+                                                scoreboard_ptr=scoreboard_ptr,
+                                                layer_id=layer_id,
+                                                task_id=task_id,
+                                                TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+                                                MAX_TASK_ID=MAX_TASK_ID,
+                                                MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP,
+                                                )
 """
     return code
 
@@ -104,7 +112,7 @@ class AttnSplitTaskBuilder(TaskBuilderBase):
 
     @classmethod
     def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
-                          tile_wise=True) -> List[TaskBase]:
+                          tile_wise=True, target_hw='gpu') -> List[TaskBase]:
         query, key_cache, v_cache, block_tables, kv_lens = io_tensors[0]
         partial_out, lse = io_tensors[1]
         assert len(query.shape) == 4, f"query shape mismatch, expect (bs, seq, nheads, head_dim), but got {query.shape}"
@@ -119,17 +127,23 @@ class AttnSplitTaskBuilder(TaskBuilderBase):
         BLOCK_DPE = q_head_dim - BLOCK_HEAD_DIM
         BLOCK_DV = triton.next_power_of_2(v_head_dim)
         NUM_KV_SPLITS = extra_params["NUM_KV_SPLITS"]
-        kernel_config = cls.create_config(**{
-            "BLOCK_HEAD_DIM": BLOCK_HEAD_DIM, "BLOCK_DPE": BLOCK_DPE, "BLOCK_DV": BLOCK_DV, "NUM_KV_SPLITS":
-            NUM_KV_SPLITS
-        })
+        if target_hw == 'gpu':
+            kernel_config = cls.create_config(**{
+                "BLOCK_HEAD_DIM": BLOCK_HEAD_DIM, "BLOCK_DPE": BLOCK_DPE, "BLOCK_DV": BLOCK_DV, "NUM_KV_SPLITS":
+                NUM_KV_SPLITS
+            })
+        else:
+            kernel_config = cls.create_config(**{
+                "BLOCK_HEAD_DIM": BLOCK_HEAD_DIM, "BLOCK_DPE": BLOCK_DPE, "BLOCK_DV": BLOCK_DV, "NUM_KV_SPLITS": NUM_KV_SPLITS, "BLOCK_N":16,
+            })
         task_id = cls.get_task_id(layer_id)
 
+        kernel_config.BLOCK_H = min(kernel_config.BLOCK_H, num_q_heads_per_group)
         BLOCK_H = kernel_config.BLOCK_H
-        NUM_KV_SPLITS = kernel_config.NUM_KV_SPLITS
         num_split_tiles = batch * cdiv(num_q_heads, min(num_q_heads_per_group, BLOCK_H)) * NUM_KV_SPLITS
         tasks = []
-        cls.log(f"Attn Split Task: num_tiles = {num_split_tiles}, kernel_config = {kernel_config}")
+        # cls.log(f"Attn Split Task: num_tiles = {num_split_tiles}, kernel_config = {kernel_config}, task_id = {task_id}, dependency = {dependency}")
+        print(f"Attn Split Task: num_tiles = {num_split_tiles}, kernel_config = {kernel_config}, task_id = {task_id}, dependency = {dependency}, NUM_KV_SPLITS = {NUM_KV_SPLITS}")
         for i in range(num_split_tiles):
             tasks.append(
                 cls._create_task(layer_id, task_id, i, num_split_tiles, kernel_config, dependency, io_tensors,
@@ -143,7 +157,7 @@ class AttnCombineTaskBuilder(TaskBuilderBase):
 
     @classmethod
     def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
-                          tile_wise=True) -> List[TaskBase]:
+                          tile_wise=True, target_hw='gpu') -> List[TaskBase]:
         kv_lens, partial_out, lse = io_tensors[0]
         output = io_tensors[1][0]
         v_head_dim = output.shape[-1]
@@ -154,11 +168,15 @@ class AttnCombineTaskBuilder(TaskBuilderBase):
 
         # guarantee that NUM_KV_SPLITS same as AttnSplit
         NUM_KV_SPLITS = extra_params["NUM_KV_SPLITS"]
-        kernel_config = cls.create_config(**{"BLOCK_DV": BLOCK_DV, "NUM_KV_SPLITS": NUM_KV_SPLITS})
+        if target_hw == 'gpu':
+            kernel_config = cls.create_config(**{"BLOCK_DV": BLOCK_DV, "NUM_KV_SPLITS": NUM_KV_SPLITS})
+        else:
+            kernel_config = cls.create_config(**{"BLOCK_DV": BLOCK_DV, "NUM_KV_SPLITS": NUM_KV_SPLITS})
+
         task_id = cls.get_task_id(layer_id)
 
         tasks = []
-        cls.log(f"Attn Combine Task: num_tiles = {num_combine_tile}, kernel_config = {kernel_config}")
+        cls.log(f"Attn Combine Task: num_tiles = {num_combine_tile}, kernel_config = {kernel_config}, task_id = {task_id}, dependency = {dependency}")
         for i in range(num_combine_tile):
             tasks.append(
                 cls._create_task(layer_id, task_id, i, num_combine_tile, kernel_config, dependency, io_tensors,

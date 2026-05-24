@@ -26,7 +26,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda.language_extra import tid
 import triton_dist.language as dl
-from .task_context import TaskBaseInfo, Scoreboard
+from .task_context_utils import TaskBaseInfo, Scoreboard
 from triton.language.extra.cuda.language_extra import (__syncthreads, atomic_cas)
 
 

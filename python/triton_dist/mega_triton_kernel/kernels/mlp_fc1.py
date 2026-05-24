@@ -1,50 +1,57 @@
-################################################################################
-#
-# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files
-# (the "Software"), to deal in the Software without restriction,
-# including without limitation the rights to use, copy, modify, merge,
-# publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#
-################################################################################
 import triton
 import triton.language as tl
-from .task_context import TaskBaseInfo, Scoreboard, TensorDesc
 from .linear import tile_wise_matmul_compute
 
+from .task_context_utils import *
 
 @triton.jit
-def fc1_task_compute(task_base_info: TaskBaseInfo, scoreboard: Scoreboard, BLOCK_SIZE_M: tl.constexpr,
-                     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, NUM_STAGES: tl.constexpr):
+def fc1_task_compute(
+                    tile_id_or_start, 
+                    io_tensors_ptr,
+                    MAX_NUM_TENSOR_DIMS: tl.constexpr,
+                    BLOCK_SIZE_M: tl.constexpr,
+                    BLOCK_SIZE_N: tl.constexpr, 
+                    SUB_BLOCK_SIZE_N: tl.constexpr, # 单次数据加载的大小
+                    BLOCK_SIZE_K: tl.constexpr, NUM_STAGES: tl.constexpr,
+                    scoreboard_ptr,
+                    layer_id,
+                    task_id,
+                    TILE_READY_SIGNAL: tl.constexpr,
+                    MAX_TASK_ID: tl.constexpr,
+                    MAX_NUM_TILES_PER_OP: tl.constexpr,
+                    ):
 
-    input: TensorDesc = task_base_info.get_tensor(0)
-    weight: TensorDesc = task_base_info.get_tensor(1)
-    output: TensorDesc = task_base_info.get_tensor(2)
+    input = task_base_info_get_tensor(io_tensors_ptr, 0, MAX_NUM_TENSOR_DIMS)
+    weight = task_base_info_get_tensor(io_tensors_ptr, 1, MAX_NUM_TENSOR_DIMS)
+    output = task_base_info_get_tensor(io_tensors_ptr, 2, MAX_NUM_TENSOR_DIMS)
 
-    M = input.size(0)
-    K = input.size(1, 16)
-    N = weight.size(0)
+    M = tensor_desc_size(input, 0)
+    K = tensor_desc_size(input, 1, 16)
+    N = tensor_desc_size(weight, 0)
 
-    a_ptr = input.data_ptr(tl.bfloat16)
-    b_ptr = weight.data_ptr(tl.bfloat16)
-    c_ptr = output.data_ptr(tl.bfloat16)
+    a_ptr = tensor_desc_data_ptr(input, tl.bfloat16)
+    b_ptr = tensor_desc_data_ptr(weight, tl.bfloat16)
+    c_ptr = tensor_desc_data_ptr(output, tl.bfloat16)
 
-    tile_id = task_base_info.tile_id_or_start
-    tile_wise_matmul_compute(tile_id, a_ptr, b_ptr, c_ptr, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
-                             NUM_STAGES)
-    scoreboard.release_tile(task_base_info, tile_id)
+    tile_id = tile_id_or_start
+    tile_wise_matmul_compute(tile_id, a_ptr, b_ptr, c_ptr, M, N, K, 
+            BLOCK_SIZE_M, 
+            BLOCK_SIZE_N, 
+            SUB_BLOCK_SIZE_N, # 单次数据加载的大小
+            BLOCK_SIZE_K,
+            NUM_STAGES
+            )
+    with al.scope(core_mode="cube"):
+        tl.sync_block_set('cube', 'vector', 11)
+    with al.scope(core_mode="vector"):
+        tl.sync_block_wait('cube', 'vector', 11)
+                             
+    scoreboard_release_tile_flat(
+        scoreboard_ptr=scoreboard_ptr, 
+        layer_id=layer_id, 
+        task_id=task_id,
+        tile_id=tile_id_or_start,
+        TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+        MAX_TASK_ID=MAX_TASK_ID,
+        MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP
+    )

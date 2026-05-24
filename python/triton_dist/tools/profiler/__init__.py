@@ -23,7 +23,7 @@
 #
 ################################################################################
 
-from .language import Profiler
+from .language_npu import Profiler
 from .viewer import export_to_perfetto_trace, parse_to_tracks
 from .context import ProfilerBuffer, alloc_profiler_buffer, reset_profiler_buffer
 

@@ -1,31 +1,9 @@
-################################################################################
-#
-# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files
-# (the "Software"), to deal in the Software without restriction,
-# including without limitation the rights to use, copy, modify, merge,
-# publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#
-################################################################################
+
 import triton
 import triton.language as tl
-from .task_context import TaskBaseInfo, Scoreboard
+from torch_npu.contrib import transfer_to_npu
 
+from .task_context_utils import *
 
 @triton.jit
 def act_mul_up_tile_compute(tile_id, input, output, M, N, ACT_FN, BLOCK_SIZE_M: tl.constexpr,
@@ -40,39 +18,62 @@ def act_mul_up_tile_compute(tile_id, input, output, M, N, ACT_FN, BLOCK_SIZE_M: 
     start_n = pid_n * BLOCK_SIZE_N
     offs_m = start_m + tl.arange(0, BLOCK_SIZE_M)
     offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)
-    offs_m = tl.where(offs_m < M, offs_m, 0)
-    offs_n_gate = tl.where(offs_n < N, offs_n, 0)
-    offs_n_up = tl.where(offs_n < N, offs_n, 0) + N
+    
     offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_SIZE_M), BLOCK_SIZE_M)
-    offs_n_gate = tl.max_contiguous(tl.multiple_of(offs_n_gate, BLOCK_SIZE_N), BLOCK_SIZE_N)
-    offs_n_up = tl.max_contiguous(tl.multiple_of(offs_n_up, BLOCK_SIZE_N), BLOCK_SIZE_N)
-    gate_ptrs = input + (offs_m[:, None] * N * 2 + offs_n_gate[None, :])
-    up_ptrs = input + (offs_m[:, None] * N * 2 + offs_n_up[None, :])
-    gate = tl.load(gate_ptrs)
-    up = tl.load(up_ptrs)
+    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_SIZE_N), BLOCK_SIZE_N)  
+    
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask = mask_m[:, None] & mask_n[None, :]
+
+    gate_ptrs = input + (offs_m[:, None] * (2 * N) + offs_n[None, :])
+    up_ptrs   = input + (offs_m[:, None] * (2 * N) + (offs_n + N)[None, :])
+
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0)
+    up   = tl.load(up_ptrs,   mask=mask, other=0.0)
+
     if ACT_FN == tl.constexpr("silu"):
         gate = gate.to(tl.float32)
         gate = gate * (1.0 / (1.0 + tl.exp((-gate))))
         gate = gate.to(gate_ptrs.dtype.element_ty)
     ret = gate * up
     ret = ret.to(output.dtype.element_ty)
-    out_ptrs = output + (offs_m[:, None] * N + offs_n_gate[None, :])
-    tl.store(out_ptrs, ret)
-
+    out_ptrs = output + (offs_m[:, None] * N + offs_n[None, :])
+    tl.store(out_ptrs, ret, mask=mask)
 
 @triton.jit
-def silu_mul_up_task_compute(task_base_info: TaskBaseInfo, scoreboard: Scoreboard, BLOCK_SIZE_M: tl.constexpr,
-                             BLOCK_SIZE_N: tl.constexpr):
-    # scoreboard.wait_deps(task_base_info)
+def silu_mul_up_task_compute(
+                             tile_id_or_start, 
+                             io_tensors_ptr,
+                             MAX_NUM_TENSOR_DIMS: tl.constexpr,
+                             BLOCK_SIZE_M: tl.constexpr,
+                             BLOCK_SIZE_N: tl.constexpr,
+                             scoreboard_ptr,
+                             layer_id,
+                             task_id,
+                             TILE_READY_SIGNAL: tl.constexpr,
+                             MAX_TASK_ID: tl.constexpr,
+                             MAX_NUM_TILES_PER_OP: tl.constexpr,
+                             ):
+    input = task_base_info_get_tensor(io_tensors_ptr, 0, MAX_NUM_TENSOR_DIMS)
+    output = task_base_info_get_tensor(io_tensors_ptr, 1, MAX_NUM_TENSOR_DIMS)
 
-    input = task_base_info.get_tensor(0)
-    output = task_base_info.get_tensor(1)
+    M = tensor_desc_size(output, 0, 16)
+    N = tensor_desc_size(output, 1, 16)
 
-    M = output.size(0, 16)
-    N = output.size(1, 16)
     ACT_FN: tl.constexpr = tl.constexpr("silu")
-    a_ptr = input.data_ptr(tl.bfloat16)
-    b_ptr = output.data_ptr(tl.bfloat16)
+    a_ptr = tensor_desc_data_ptr(input, tl.bfloat16)
+    b_ptr = tensor_desc_data_ptr(output, tl.bfloat16)
 
-    act_mul_up_tile_compute(task_base_info.tile_id_or_start, a_ptr, b_ptr, M, N, ACT_FN, BLOCK_SIZE_M, BLOCK_SIZE_N)
-    scoreboard.release_tile(task_base_info, task_base_info.tile_id_or_start)
+    act_mul_up_tile_compute(tile_id_or_start, a_ptr, b_ptr, M, N, ACT_FN, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    
+    
+    scoreboard_release_tile_flat(
+        scoreboard_ptr, 
+        layer_id=layer_id, 
+        task_id=task_id,
+        tile_id=tile_id_or_start,
+        TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+        MAX_TASK_ID=MAX_TASK_ID,
+        MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP
+    )

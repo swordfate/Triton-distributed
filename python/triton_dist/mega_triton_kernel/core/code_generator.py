@@ -1,34 +1,10 @@
-################################################################################
-#
-# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files
-# (the "Software"), to deal in the Software without restriction,
-# including without limitation the rights to use, copy, modify, merge,
-# publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#
-################################################################################
 from typing import List, Dict, Tuple
 import textwrap
 from .registry import registry
 from .task_base import TaskBase, CodeGenKey
 
 
-def make_mega_kernel_src(tasks_dispatch_code: str, enalbe_profiling: bool, task_types_and_str: Dict[int, str]) -> str:
+def make_mega_kernel_src(tasks_dispatch_code: str, enalbe_profiling: bool, task_types_and_str: Dict[int, str], target_hw: str) -> str:
     """
         max_task_type: profiling use only
     """
@@ -37,17 +13,20 @@ def make_mega_kernel_src(tasks_dispatch_code: str, enalbe_profiling: bool, task_
         max_task_type = max(max_task_type, k)
     scoreboard_wait_deps_task_type = max_task_type + 1
     task_decoding_task_type = scoreboard_wait_deps_task_type + 1
+    load_before_wait_type = task_decoding_task_type + 1
     task_types_and_str[scoreboard_wait_deps_task_type] = "scoreboard_wait_deps"
     task_types_and_str[task_decoding_task_type] = "task_decoding"
+    task_types_and_str[load_before_wait_type] = "load_before_wait"
 
-    src = f"""
+    if target_hw == 'gpu':
+        src = f"""
 import triton
 import triton.language as tl
-from triton_dist.mega_triton_kernel.kernels import *
+from mega_triton_kernel_ascend.kernels_for_gpu import *
 
-from triton_dist.mega_triton_kernel.kernels.task_context import Scoreboard
-from triton_dist.tools.profiler import Profiler
-from triton.language.extra.cuda.language_extra import tid
+from mega_triton_kernel_ascend.kernels_for_gpu.task_context import Scoreboard
+from mega_triton_kernel_ascend.tools.profiler import Profiler
+# from triton.language.extra.cuda.language_extra import tid
 @triton.jit
 def MEGA_TRITON_KERNEL(
     {"profiler_buf, # ensor<uint64>" if enalbe_profiling else ""}
@@ -102,6 +81,113 @@ def MEGA_TRITON_KERNEL(
 {textwrap.indent(tasks_dispatch_code.strip(), '        ')}
         {"profiler = profiler.record(is_start=False, task_type=task_type)" if enalbe_profiling else ""}
 """
+    else:
+        aic = []
+        for k,v in task_types_and_str.items():
+            if v in ['QKVProjTask', 'PagedGQAFwdTask', 'OProjTask', 'MLPFC1Task', 'MLPFC2Task', 'LinearTask', 'AttnSplitTask']:
+                aic.append(k)
+        src = f"""
+import triton
+import triton.language as tl
+from mega_triton_kernel_ascend.kernels_for_npu import *
+
+from mega_triton_kernel_ascend.kernels_for_npu.task_context_utils import *
+from mega_triton_kernel_ascend.tools.profiler import init_profiler, record_event
+# from triton.language.extra.cuda.language_extra import tid
+
+# for 新版分布式TA
+from triton.language.extra.cann import extension as al
+tl.sync_block_set = al.sync_block_set
+tl.sync_block_wait = al.sync_block_wait
+tl.extract_slice = al.extract_slice
+
+@triton.jit
+def MEGA_TRITON_KERNEL(
+    {"profiler_buf, # ensor<uint64>" if enalbe_profiling else ""}
+    work_queues, # [MAX_INS, NUM_SMS, INS], int32
+    num_tasks_per_wq, #[num_sms,]
+    scoreboard_ptr,
+    task_deps_ptr,  # [num_deps_entry_of_all_tasks, INT_PER_DEPS]
+
+    INT_PER_DEPS: tl.constexpr,
+    INT_PER_TASK: tl.constexpr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    num_warps: tl.constexpr,
+    debug_counts,
+):
+    pid = tl.program_id(0)
+    {f"prof_base_ptr, prof_offset, prof_stride = init_profiler(pid, profiler_buf, 0, 1, num_blocks=NUM_SMS, ENABLE_PROFILING={enalbe_profiling})" if enalbe_profiling else ""}
+
+    # 1. 移除 Scoreboard 和 TaskBaseInfo 对象的实例化
+    TILE_READY_SIGNAL: tl.constexpr = 2 # 定义信号值
+
+    WARP_SIZE: tl.constexpr = 32
+    NUM_THREADS: tl.constexpr = num_warps * WARP_SIZE
+    sm_id = tl.program_id(axis=0)
+    num_tasks = tl.load(num_tasks_per_wq + sm_id)
+    offset = INT_PER_TASK * NUM_SMS
+
+    TASK_TYPE_OFFSET = 0
+    LAYER_ID_OFFSET = 1
+    TASK_ID_OFFSET = 2
+    TILE_ID_OR_START_OFFSET = 3
+    DEPEND_ENTRY_START_OFFSET = 4
+    DEPEND_ENTRY_END_OFFSET = 5
+    IO_TENSORS_OFFSET = 6
+
+    for i in range(num_tasks):
+        {f"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+        task_type = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TASK_TYPE_OFFSET).to(tl.int32)
+        layer_id = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + LAYER_ID_OFFSET).to(tl.int32)
+        task_id = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TASK_ID_OFFSET).to(tl.int32)
+        tile_id_or_start = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TILE_ID_OR_START_OFFSET).to(tl.int32)
+        depend_entry_start = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + DEPEND_ENTRY_START_OFFSET).to(tl.int32)
+        depend_entry_end = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + DEPEND_ENTRY_END_OFFSET).to(tl.int32)
+        io_tensors_ptr = work_queues + i * offset + sm_id * INT_PER_TASK + IO_TENSORS_OFFSET
+
+        {f"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={load_before_wait_type}, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+
+        {f"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+        with al.scope(core_mode="vector"):
+            # 3. 在主循环中调用扁平化的 wait_deps 函数
+            scoreboard_wait_deps_flat(
+                scoreboard_ptr, 
+                task_deps_ptr,
+                depend_entry_start, 
+                depend_entry_end,
+                INT_PER_DEPS=INT_PER_DEPS,
+                TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+                debug_counts=debug_counts,
+            )
+        
+
+        # 访存保序
+        if (task_type=={aic[0]} or (task_type=={aic[1]} or (task_type=={aic[2]} or (task_type=={aic[3]} or (task_type=={aic[4]} or task_type=={aic[5]}))))) and (depend_entry_end > depend_entry_start):
+            with al.scope(core_mode="vector"):
+                tl.sync_block_set('vector', 'cube', 5)
+            with al.scope(core_mode="cube"):
+                tl.sync_block_wait('vector', 'cube', 5)
+        else:
+            with al.scope(core_mode="vector"):
+                dummy = tl.arange(0, 1)
+                tl.inline_asm_elementwise(
+                    asm="BAR.ALL",
+                    constraints="=l,0",
+                    args=[dummy],
+                    dtype=tl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+
+        {f"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+        #### run task ####
+        {"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+{textwrap.indent(tasks_dispatch_code.strip(), '        ')}
+        {"prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)" if enalbe_profiling else ""}
+"""    
     return src, task_types_and_str
 
 
@@ -166,7 +252,7 @@ class CodeGenerator:
 {textwrap.indent(all_codes.strip(), '    ')}
 """
 
-    def generate_code(self, tasks: List['TaskBase'], enable_profiling=False) -> str:
+    def generate_code(self, tasks: List['TaskBase'], enable_profiling=False, target_hw='gpu') -> str:
         self._condition_and_codes.clear()
         self._task_types_and_str.clear()
 
@@ -174,7 +260,7 @@ class CodeGenerator:
             key = task.get_codegen_key(task.layer_id, task.task_id)
             assert isinstance(key, CodeGenKey)
             task_type = type(task)
-            code = registry.get_codegen(task_type)(task)
+            code = registry.get_codegen(task_type)(task, target_hw)
             if key.task_type not in self._condition_and_codes:
                 self._condition_and_codes[key.task_type] = []
             self._condition_and_codes[key.task_type].append((key, code))
@@ -189,5 +275,5 @@ class CodeGenerator:
             is_first_branch = False
 
         mege_kernel_src, self._task_types_and_str = make_mega_kernel_src(tasks_dispatch_code, enable_profiling,
-                                                                         self._task_types_and_str)
+                                                                         self._task_types_and_str, target_hw)
         return mege_kernel_src, self._task_types_and_str

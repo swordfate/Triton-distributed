@@ -1,30 +1,11 @@
-################################################################################
-#
-# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files
-# (the "Software"), to deal in the Software without restriction,
-# including without limitation the rights to use, copy, modify, merge,
-# publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#
-################################################################################
 import torch
 from torch import nn
 
+try:
+    import shmem as ash
+except ImportError:
+    ash = None
+    print("No shmem!")
 
 def shard_local(tensor: torch.Tensor, world_size: int, dim: int, local_rank: int):
     tensor_dim = tensor.shape[dim]
@@ -82,6 +63,12 @@ class TPMLPBuilder:
             print(
                 f"[RANK {self.rank}] MLP initialized with parameters: gate_up_proj shape: {self.gate_up_proj.shape}, down_proj shape: {self.down_proj.shape}"
             )
+        
+        if self.world_size > 1:
+            self.barrier_tensor = ash.aclshmem_create_tensor([self.world_size * 8 * 2], dtype=torch.int64, device_id=self.rank)
+            self.barrier_intra_node = ash.aclshmem_create_tensor([self._builder.NUM_SMS * 8], dtype=torch.int64, device_id=self.rank)
+            self.barrier_tensor.zero_()
+            self.barrier_intra_node.zero_()
 
     def build_fwd(self, x, fc1_output=None, act_out=None, fc2_out=None, ar_out=None):
         """
@@ -97,9 +84,19 @@ class TPMLPBuilder:
         act_out = torch.empty(num_tokens, self.gate_up_proj.shape[0] //
                               2, dtype=x.dtype, device=x.device) if act_out is None else act_out
         if self.world_size > 1:
-            fc2_out = self._builder.create_symm_tensor(
-                (num_tokens, hidden_size), x.dtype) if fc2_out is None else fc2_out
-            ar_out = torch.empty(num_tokens, hidden_size, dtype=x.dtype, device=x.device) if ar_out is None else ar_out
+            # fc2_out = self._builder.create_symm_tensor(
+            #     (num_tokens, hidden_size), x.dtype) if fc2_out is None else fc2_out
+            # ar_out = torch.empty(num_tokens, hidden_size, dtype=x.dtype, device=x.device) if ar_out is None else ar_out
+            # 分布式
+            BLOCK_SIZE_B = 16 # TODO: same as BLOCK_SIZE_M of MLPFCx
+            prob_size_in_rank = (num_tokens + self.world_size - 1) // self.world_size
+            b_loops = (prob_size_in_rank + BLOCK_SIZE_B - 1) // BLOCK_SIZE_B
+            padded_B_in_rank = b_loops * BLOCK_SIZE_B
+            peer_mem_elements = num_tokens * hidden_size + padded_B_in_rank * hidden_size
+            peer_mem = ash.aclshmem_create_tensor([peer_mem_elements], dtype=x.dtype, device_id=self.rank)
+            # fc2_out = peer_mem[:num_tokens * hidden_size].view(num_tokens, hidden_size)
+            fc2_out = peer_mem.view(-1, hidden_size)
+            ar_out = torch.empty(num_tokens, hidden_size, dtype=x.dtype, device=x.device) if ar_out is None else ar_out # result of All-Reduce
         else:
             assert ar_out is None
             fc2_out = torch.empty(num_tokens, hidden_size, dtype=x.dtype,
@@ -108,6 +105,13 @@ class TPMLPBuilder:
         self._builder.make_silu_mul_up(fc1_output, act_out)
         self._builder.make_fc2(act_out, self.down_proj, fc2_out)
         if self.world_size > 1:
-            self._builder.make_allreduce(fc2_out, ar_out, double_input_buffer=True)
+            # self._builder.make_allreduce(fc2_out, ar_out, double_input_buffer=True)
+            # return ar_out.reshape(batch_size, seq_len, hidden_size)
+            # 分布式
+            self._builder.make_allreduce_ascend(
+                peer_mem, ar_out, 
+                barrier_global=self.barrier_tensor,
+                barrier_intra=self.barrier_intra_node,
+            )
             return ar_out.reshape(batch_size, seq_len, hidden_size)
         return fc2_out.reshape(batch_size, seq_len, hidden_size)

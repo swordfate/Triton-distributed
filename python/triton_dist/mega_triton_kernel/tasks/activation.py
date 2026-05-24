@@ -1,27 +1,3 @@
-################################################################################
-#
-# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files
-# (the "Software"), to deal in the Software without restriction,
-# including without limitation the rights to use, copy, modify, merge,
-# publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#
-################################################################################
 from typing import Any, Dict, List
 from .utils import cdiv
 from dataclasses import dataclass
@@ -52,10 +28,26 @@ def silu_mul_up_config_factory(**kwargs) -> SiLUMulUpConfig:
     return SiLUMulUpConfig(**default)
 
 
-def codegen_silu_mul_up_fc1(task: SiLUMulUpTask) -> str:
+def codegen_silu_mul_up_fc1(task: SiLUMulUpTask, target_hw: str) -> str:
     config: SiLUMulUpConfig = task.config
-    code = f"""
+    if target_hw == 'gpu':
+        code = f"""
 silu_mul_up_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N})
+"""
+    else:
+        code = f"""
+with al.scope(core_mode="vector"):
+    silu_mul_up_task_compute(
+                            tile_id_or_start=tile_id_or_start, MAX_NUM_TENSOR_DIMS=MAX_NUM_TENSOR_DIMS,
+                            io_tensors_ptr=io_tensors_ptr,
+                            BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
+                            scoreboard_ptr=scoreboard_ptr,
+                            layer_id=layer_id,
+                            task_id=task_id,
+                            TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+                            MAX_TASK_ID=MAX_TASK_ID,
+                            MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP,
+                            )
 """
     return code
 
@@ -72,8 +64,10 @@ class SiLUMulUpTaskBuilder(TaskBuilderBase):
 
     @classmethod
     def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
-                          tile_wise=True) -> List[TaskBase]:
+                          tile_wise=True, target_hw='gpu') -> List[TaskBase]:
         kernel_config = cls.create_config()
+        if target_hw == 'npu':
+            kernel_config.BLOCK_SIZE_N = 1280
         task_id = cls.get_task_id(layer_id)
         BLOCK_SIZE_M = kernel_config.BLOCK_SIZE_M
         BLOCK_SIZE_N = kernel_config.BLOCK_SIZE_N
@@ -85,7 +79,7 @@ class SiLUMulUpTaskBuilder(TaskBuilderBase):
         num_sm = device_prop.NUM_SMS
         tasks = []
         cls.log(
-            f"SiLUMulUp Task: M = {M}, N = {N}, num_tiles = {num_tiles}, num_sm = {num_sm}, tile_wise = {tile_wise}")
+            f"SiLUMulUp Task: M = {M}, N = {N}, num_tiles = {num_tiles}, num_sm = {num_sm}, tile_wise = {tile_wise}, dependency = {dependency}")
         for tm in range(num_tiles_m):
             for tn in range(num_tiles_n):
                 tile_id = tm * num_tiles_n + tn
@@ -106,5 +100,5 @@ class SiLUMulUpTaskBuilder(TaskBuilderBase):
 
     @classmethod
     def build_tasks(cls, device_prop: 'DeviceProp', layer_id: int, dependency: TaskDependency,
-                    io_tensors: List[List['torch.Tensor']], extra_params: Dict[str, Any]) -> List[TaskBase]:
-        return cls._build_tasks_impl(device_prop, layer_id, dependency, io_tensors, extra_params)
+                    io_tensors: List[List['torch.Tensor']], extra_params: Dict[str, Any], target_hw: str) -> List[TaskBase]:
+        return cls._build_tasks_impl(device_prop, layer_id, dependency, io_tensors, extra_params, target_hw=target_hw)

@@ -1,37 +1,19 @@
-################################################################################
-#
-# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files
-# (the "Software"), to deal in the Software without restriction,
-# including without limitation the rights to use, copy, modify, merge,
-# publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#
-################################################################################
 import torch
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
-from triton_dist.models import ModelConfig
-from triton_dist.models.utils import init_model_cpu
+from mega_triton_kernel_ascend.models import ModelConfig
+from mega_triton_kernel_ascend.models.utils import init_model_cpu
 from .utils import prepare_cos_sin_cache
 from .layers import TPMLPBuilder, TPAttnBuilder
 from .paged_kv_cache import PagedKVCache
 from .model_builder import ModelBuilder
+import torch.distributed as dist
 
+try:
+    import shmem as ash
+except ImportError:
+    ash = None
+    print("No shmem!")
 
 def shard_local(tensor: torch.Tensor, world_size: int, dim: int, local_rank: int):
     tensor_dim = tensor.shape[dim]
@@ -67,6 +49,7 @@ class Qwen3LayerBuilder:
         self.world_size = world_size
         self.layer_idx = layer_idx
         self.head_dim = head_dim
+        
 
     def init_parameters(self, hf_layer: Qwen3DecoderLayer):
         self.mlp = TPMLPBuilder(builder=self._builder, rank=self.rank, world_size=self.world_size)
@@ -85,17 +68,19 @@ class Qwen3LayerBuilder:
                   kv_cache: PagedKVCache):
         assert len(hidden_states.shape) == 3 and hidden_states.dtype == torch.bfloat16
         batch_size, seq_len, hidden_size = hidden_states.shape
-        input_norm_out = torch.empty_like(hidden_states)
-        attn_residual_out = torch.empty_like(hidden_states)
+        input_norm_out = torch.zeros_like(hidden_states)
+        attn_residual_out = torch.zeros_like(hidden_states)
 
-        post_norm_out = torch.empty_like(hidden_states)
-        mlp_residual_out = torch.empty_like(hidden_states)
+        post_norm_out = torch.zeros_like(hidden_states)
+        mlp_residual_out = torch.zeros_like(hidden_states)
 
         # attn
         self._builder.make_rms_norm(hidden_states, self.input_norm_w, input_norm_out, self.input_norm_eps)
+        # return input_norm_out
         attn_out = self.attn.build_fwd(input_norm_out, cos_cache, sin_cache, kv_cache)
+        # return attn_out, obsv
         self._builder.make_add(hidden_states, attn_out, attn_residual_out)
-
+        # return attn_residual_out
         # mlp
         self._builder.make_rms_norm(
             attn_residual_out, self.post_norm_w, post_norm_out,
@@ -133,19 +118,26 @@ class Qwen3Model:
         self.init_parameters()
         self.hidden_state_buffer = torch.empty((batch_size, 1, self.hidden_size), dtype=self.dtype,
                                                device=torch.cuda.current_device())
-        self.kv_cache = PagedKVCache(num_layers=self.num_layers, batch_size=self.batch_size, max_length=self.max_length,
+        self.kv_cache = PagedKVCache(PAGE_SIZE=64, num_layers=self.num_layers, batch_size=self.batch_size, max_length=self.max_length,
                                      num_kv_heads=self.num_key_value_heads // self.world_size, head_dim=self.head_dim,
                                      dtype=self.dtype)
         self.mega_out = self.build_fwd(self.hidden_state_buffer, self.kv_cache)
+        # CHANGE: 把 kvcache 传给 builder，方便build中compile的时候传入megakernel
+        # self._builder.k_cache = self.kv_cache.key_cache
+        # self._builder.v_cache = self.kv_cache.value_cache
+
         self._builder.compile()
         torch.cuda.synchronize()
         if self.world_size > 1:
             torch.distributed.barrier()
+            self._builder.model = self
 
     def init_parameters(self):
         hf_model = init_model_cpu(self.model_name, dtype=self.dtype)
         self.embed_tokens = hf_model.model.embed_tokens.weight.detach().cuda()
-        self.lm_head = hf_model.lm_head.weight.detach().cuda()
+        self.lm_head = shard_local(hf_model.lm_head.weight.detach(), self.world_size, 0, self.rank).to("cuda",non_blocking=True)
+        # self.lm_head = hf_model.lm_head.weight.detach().cuda()
+        self.vocab_size = self.lm_head.shape[0] * self.world_size
         self.norm_weight = hf_model.model.norm.weight.detach().cuda()
         self.norm_variance_epsilon = hf_model.model.norm.variance_epsilon
         cos_cache, sin_cache = prepare_cos_sin_cache(self.head_dim, max_position_embeddings=self.max_length,
@@ -163,6 +155,10 @@ class Qwen3Model:
             self.layers.append(layer)
             hf_model.model.layers[idx] = None
 
+        if self.world_size > 1:
+            self.barrier_tensor = ash.aclshmem_create_tensor([self.world_size * 8], dtype=torch.int64, device_id=self.rank)
+            self.barrier_tensor.zero_()
+
         self.num_layers = len(self.layers)
 
     def build_fwd(self, hidden_states: torch.Tensor, kv_cache: PagedKVCache):
@@ -178,13 +174,24 @@ class Qwen3Model:
                 kv_cache=kv_cache,
             )
 
-        rms_norm_out = torch.empty_like(hidden_states)
+        rms_norm_out = torch.zeros_like(hidden_states)
         self._builder.make_rms_norm(hidden_states, self.norm_weight, rms_norm_out, self.norm_variance_epsilon)
         if self.build_lm_head:
-            logits = torch.empty((batch_size, seq_len, self.lm_head.shape[0]), dtype=rms_norm_out.dtype,
+            if self.world_size > 1:
+                peer_mem_elements = batch_size * seq_len * self.lm_head.shape[0]
+                peer_mem = ash.aclshmem_create_tensor([peer_mem_elements], dtype=rms_norm_out.dtype, device_id=self.rank)
+                linear_out = peer_mem.view(-1, self.lm_head.shape[0])
+            else:
+                linear_out = torch.zeros((batch_size * seq_len, self.lm_head.shape[0]), dtype=rms_norm_out.dtype,
                                  device=rms_norm_out.device)
             self._builder.make_linear(rms_norm_out.reshape(-1, hidden_size), self.lm_head,
-                                      logits.reshape(-1, self.lm_head.shape[0]))
+                                      linear_out)
+            if self.world_size > 1:
+                logits = torch.zeros((batch_size * seq_len, self.vocab_size), dtype=rms_norm_out.dtype,
+                                 device=rms_norm_out.device)
+                self._builder.make_gather_all(peer_mem, logits, barrier_global = self.barrier_tensor)
+            else:
+                logits = linear_out
             return logits
         else:
             return rms_norm_out
@@ -195,8 +202,9 @@ class Qwen3Model:
         self.hidden_state_buffer.copy_(hidden_states)
         # inplace write to mega out tensor
         self._builder.run()
+        # print(f'mega_forward self.mega_out.shape = {self.mega_out.shape}')
         if self.build_lm_head:
-            return self.mega_out
+            logits = self.mega_out.view(batch_size, seq_len, -1)
         else:
             logits = torch.nn.functional.linear(self.mega_out, self.lm_head).float()
-            return logits
+        return logits

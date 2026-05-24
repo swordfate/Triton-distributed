@@ -1,27 +1,3 @@
-################################################################################
-#
-# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files
-# (the "Software"), to deal in the Software without restriction,
-# including without limitation the rights to use, copy, modify, merge,
-# publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#
-################################################################################
 from triton import next_power_of_2
 from typing import Tuple, List
 import dataclasses
@@ -41,11 +17,11 @@ class QKVPackQKNormRopeSplitVConfig(ConfigBase):
 
 @dataclass
 class QKNormRopeUpdateKVCacheConfig(ConfigBase):
-    pass
+    BLOCK_SIZE_B: int = 1
 
 @dataclass
 class RMSNormConfig(ConfigBase):
-    BLOCK_SIZE_N: int = 2048
+    BLOCK_SIZE_N: int = 4096
 
 
 @dataclass
@@ -87,7 +63,8 @@ def rms_norm_config_factory(**kwargs) -> RMSNormConfig:
     return dataclasses.replace(RMSNormConfig(), **kwargs)
 
 
-def codegen_qk_norm_rope_update_kvcache(task: QKNormRopeUpdateKVCacheTask) -> str:
+def codegen_qk_norm_rope_update_kvcache(task: QKNormRopeUpdateKVCacheTask, target_hw: str) -> str:
+    config : QKNormRopeUpdateKVCacheConfig = task.config
     qkv, block_tables, kv_lens, q_rms_weight, k_rms_weight, cos_cache, sin_cache = task.io_tensors[0]
     key_cache, value_cache, q_norm_rope = task.io_tensors[1]
     Q_HEAD_DIM = qkv.shape[-1]
@@ -96,20 +73,54 @@ def codegen_qk_norm_rope_update_kvcache(task: QKNormRopeUpdateKVCacheTask) -> st
     NUM_Q_HEADS = qkv.shape[-2] - 2 * NUM_KV_HEADS
     PAGE_SIZE, NUM_KV_HEADS, V_HEAD_DIM = value_cache.shape[-3], value_cache.shape[-2], value_cache.shape[-1]
     MAX_NUM_BLOCKS_PER_SEQ = block_tables.shape[-1]
-    code = f"""
+    if target_hw == 'gpu':
+        code = f"""
 rmsnorm_rope_update_kv_cache_task_compute(
     task_base_info, scoreboard, NUM_Q_HEADS={NUM_Q_HEADS}, NUM_KV_HEADS={NUM_KV_HEADS}, Q_HEAD_DIM={Q_HEAD_DIM},
     V_HEAD_DIM={V_HEAD_DIM}, PAGE_SIZE={PAGE_SIZE}, MAX_NUM_BLOCKS_PER_SEQ={MAX_NUM_BLOCKS_PER_SEQ},
-    Q_RMS_EPS={task.extra_params["q_rms_eps"]}, K_RMS_EPS={task.extra_params["k_rms_eps"]}
-)
+    Q_RMS_EPS={task.extra_params["q_rms_eps"]}, K_RMS_EPS={task.extra_params["k_rms_eps"]})
+"""
+    else:
+        code = f"""
+with al.scope(core_mode="vector"):
+    rmsnorm_rope_update_kv_cache_task_compute(
+                                            tile_id_or_start=tile_id_or_start, MAX_NUM_TENSOR_DIMS=MAX_NUM_TENSOR_DIMS,
+                                            io_tensors_ptr=io_tensors_ptr,
+                                            NUM_Q_HEADS={NUM_Q_HEADS}, NUM_KV_HEADS={NUM_KV_HEADS}, Q_HEAD_DIM={Q_HEAD_DIM},
+                                            V_HEAD_DIM={V_HEAD_DIM}, PAGE_SIZE={PAGE_SIZE}, MAX_NUM_BLOCKS_PER_SEQ={MAX_NUM_BLOCKS_PER_SEQ},
+                                            Q_RMS_EPS={task.extra_params["q_rms_eps"]}, K_RMS_EPS={task.extra_params["k_rms_eps"]},
+                                            BLOCK_SIZE_B={config.BLOCK_SIZE_B},
+                                            scoreboard_ptr=scoreboard_ptr,
+                                            layer_id=layer_id,
+                                            task_id=task_id,
+                                            TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+                                            MAX_TASK_ID=MAX_TASK_ID,
+                                            MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP,
+                                            )
 """
     return code
 
 
-def codegen_rms_norm(task: RMSNormTask) -> str:
+def codegen_rms_norm(task: RMSNormTask, target_hw: str) -> str:
     config: RMSNormConfig = task.config
-    code = f"""
+    if target_hw == 'gpu':
+        code = f"""
 rmsnorm_task_compute(task_base_info, scoreboard, RMS_EPS={task.extra_params["rms_eps"]}, BLOCK_SIZE_N = {config.BLOCK_SIZE_N})
+"""
+    else:
+        code = f"""
+with al.scope(core_mode="vector"):
+    rmsnorm_task_compute(
+                        tile_id_or_start=tile_id_or_start, MAX_NUM_TENSOR_DIMS=MAX_NUM_TENSOR_DIMS,
+                        io_tensors_ptr=io_tensors_ptr,
+                        RMS_EPS={task.extra_params["rms_eps"]}, BLOCK_SIZE_N = {config.BLOCK_SIZE_N},
+                        scoreboard_ptr=scoreboard_ptr,
+                        layer_id=layer_id,
+                        task_id=task_id,
+                        TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+                        MAX_TASK_ID=MAX_TASK_ID,
+                        MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP,
+                        )
 """
     return code
 
@@ -138,7 +149,7 @@ class QKNormRopeUpdateKVCacheTaskBuilder(TaskBuilderBase):
 
     @classmethod
     def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
-                          tile_wise=True) -> List[TaskBase]:
+                          tile_wise=True, target_hw='gpu') -> List[TaskBase]:
         qkv, block_tables, kv_lens, q_rms_weight, k_rms_weight, cos_cache, sin_cache = io_tensors[0]
         key_cache, value_cache, q_norm_rope = io_tensors[1]
         task_id = cls.get_task_id(layer_id)
@@ -147,8 +158,11 @@ class QKNormRopeUpdateKVCacheTaskBuilder(TaskBuilderBase):
         batch, seq_len, num_qkv_heads, head_dim = qkv.shape
         num_kv_heads = key_cache.shape[-2]
         num_qk_heads = num_qkv_heads - num_kv_heads
-        num_tiles = batch * seq_len * num_qk_heads
-        cls.log(f"KNormRopeUpdateKVCache Task: num_tiles = {num_tiles}")
+        kernel_config.BLOCK_SIZE_B = cdiv(batch * seq_len * num_qk_heads, device_prop.NUM_SMS)
+        kernel_config.BLOCK_SIZE_B = min(batch, kernel_config.BLOCK_SIZE_B)
+        block_b = cdiv(batch, kernel_config.BLOCK_SIZE_B)
+        num_tiles = block_b * seq_len * num_qk_heads
+        cls.log(f"KNormRopeUpdateKVCache Task: num_tiles = {num_tiles}, task_id = {task_id}, dependency = {dependency}")
         tasks = []
         for i in range(num_tiles):
             tasks.append(
@@ -162,13 +176,16 @@ class RMSNormTaskBuilder(TaskBuilderBase):
 
     @classmethod
     def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
-                          tile_wise=True) -> List[TaskBase]:
+                          tile_wise=True, target_hw='gpu') -> List[TaskBase]:
         input, weight = io_tensors[0]
         output = io_tensors[1][0]
         num_tiles = output.numel() // output.shape[-1]
         task_id = cls.get_task_id(layer_id)
         kernel_config = cls.create_config()
-        cls.log(f"RMS Norm Task: num_tiles = {num_tiles}")
+        if target_hw == 'npu':
+            kernel_config.BLOCK_SIZE_N = 4096
+        # cls.log(f"RMS Norm Task: num_tiles = {num_tiles}, task_id = {task_id}, dependency = {dependency}")
+        print(f"RMS Norm Task: num_tiles = {num_tiles}, task_id = {task_id}, dependency = {dependency}")
         tasks = []
         tile_size = output.shape[-1]
         for i in range(num_tiles):
@@ -204,7 +221,10 @@ class QKVPackQKNormRopeSplitVTaskBuilder(TaskBuilderBase):
         BLOCK_HD = next_power_of_2(head_dim)
         task_id = cls.get_task_id(layer_id)
         kernel_config = cls.create_config(BLOCK_HD=BLOCK_HD)
+        kernel_config.BLOCK_SIZE_B = cdiv(bs * num_tiles_seq * num_total_heads, cls.NUM_SMS)
         num_tiles_seq = cdiv(seq_len, kernel_config.BLOCK_SEQ)
+        B_blocks = cdiv(bs, kernel_config.BLOCK_SIZE_B)
+        # num_tiles = B_blocks * num_tiles_seq * num_total_heads
         num_tiles = bs * num_tiles_seq * num_total_heads
         cls.log(f"QKVPackQKNormRopeSplitVTask Task: num_tiles = {num_tiles}")
         tasks = []

@@ -24,7 +24,7 @@
 ################################################################################
 import triton
 import triton.language as tl
-from .task_context import TaskBaseInfo, Scoreboard
+from .task_context_utils import TaskBaseInfo, Scoreboard
 
 
 @triton.jit

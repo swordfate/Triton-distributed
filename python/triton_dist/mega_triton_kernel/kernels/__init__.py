@@ -23,7 +23,7 @@
 #
 ################################################################################
 from .mlp_fc1 import fc1_task_compute
-from .task_context import TaskBaseInfo
+from .task_context_utils import TaskBaseInfo
 from .activation import silu_mul_up_task_compute
 from .flash_decode import attn_gqa_fwd_batch_decode_combine_task_compute, attn_gqa_fwd_batch_decode_split_kv_task_compute
 from .flash_attn import qkv_pack_flash_attn_task_compute, flash_attn_task_compute
