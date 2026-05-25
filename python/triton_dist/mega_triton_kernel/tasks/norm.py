@@ -158,15 +158,46 @@ class QKNormRopeUpdateKVCacheTaskBuilder(TaskBuilderBase):
         batch, seq_len, num_qkv_heads, head_dim = qkv.shape
         num_kv_heads = key_cache.shape[-2]
         num_qk_heads = num_qkv_heads - num_kv_heads
+        num_q_heads = num_qkv_heads - 2 * num_kv_heads
         kernel_config.BLOCK_SIZE_B = cdiv(batch * seq_len * num_qk_heads, device_prop.NUM_SMS)
         kernel_config.BLOCK_SIZE_B = min(batch, kernel_config.BLOCK_SIZE_B)
-        block_b = cdiv(batch, kernel_config.BLOCK_SIZE_B)
+        BLOCK_SIZE_B = kernel_config.BLOCK_SIZE_B
+        block_b = cdiv(batch, BLOCK_SIZE_B)
         num_tiles = block_b * seq_len * num_qk_heads
         cls.log(f"KNormRopeUpdateKVCache Task: num_tiles = {num_tiles}, task_id = {task_id}, dependency = {dependency}")
         tasks = []
         for i in range(num_tiles):
+            # tile → (batch_group, seq, head) 映射 (与 kernel 一致)
+            idx_0 = i // num_qk_heads
+            idx_1 = i % num_qk_heads
+            batch_grp_idx = idx_0 // seq_len
+            seq_idx = idx_0 % seq_len
+            batch_start = batch_grp_idx * BLOCK_SIZE_B
+            valid_batch = min(BLOCK_SIZE_B, batch - batch_start)
+
+            # 输入 qkv: 每个 tile 处理 batch_group 范围内的所有 head
+            # (V 数据在 K head tile 中非连续, 因此使用全 head 范围近似)
+            qkv_desc = InputDependencyDesc(
+                qkv, require_full=False,
+                start_indices=(batch_start, seq_idx, 0, 0),
+                data_sizes=(valid_batch, 1, num_qkv_heads, head_dim))
+            inputs_dep = {qkv: qkv_desc}
+
+            # 输出 q_norm_rope: Q head tile 产生 tile 级输出, K head tile 不产生
+            if idx_1 < num_q_heads:
+                out_desc = OutputTilingDesc(
+                    start_indices=(batch_start, seq_idx, idx_1, 0),
+                    tile_sizes=(valid_batch, 1, 1, head_dim))
+                # key_cache / value_cache 输出位置由 block_table 运行时决定, 保持 full-dep
+                outs_tile_mapping = {q_norm_rope: out_desc}
+            else:
+                # K head tile 不产生 q_norm_rope, key_cache/value_cache 保持 full-dep
+                empty_desc = OutputTilingDesc(start_indices=(0, 0, 0, 0), tile_sizes=(0, 0, 0, 0))
+                outs_tile_mapping = {q_norm_rope: empty_desc}
+
             tasks.append(
-                cls._create_task(layer_id, task_id, i, num_tiles, kernel_config, dependency, io_tensors, extra_params))
+                cls._create_task(layer_id, task_id, i, num_tiles, kernel_config, dependency, io_tensors, extra_params,
+                                 inputs_dep=inputs_dep, outs_tile_mapping=outs_tile_mapping))
         return tasks
 
 

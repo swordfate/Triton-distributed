@@ -4,7 +4,7 @@ from .utils import cdiv
 import triton
 import dataclasses
 from dataclasses import dataclass
-from ..core.task_base import TaskBase, TaskDependency
+from ..core.task_base import TaskBase, TaskDependency, InputDependencyDesc, OutputTilingDesc
 from ..core.builder import TaskBuilderBase
 from ..core.registry import registry
 from ..core.config import ConfigBase
@@ -140,14 +140,31 @@ class AttnSplitTaskBuilder(TaskBuilderBase):
 
         kernel_config.BLOCK_H = min(kernel_config.BLOCK_H, num_q_heads_per_group)
         BLOCK_H = kernel_config.BLOCK_H
-        num_split_tiles = batch * cdiv(num_q_heads, min(num_q_heads_per_group, BLOCK_H)) * NUM_KV_SPLITS
+        head_blocks = cdiv(num_q_heads, min(num_q_heads_per_group, BLOCK_H))
+        num_split_tiles = batch * head_blocks * NUM_KV_SPLITS
         tasks = []
-        # cls.log(f"Attn Split Task: num_tiles = {num_split_tiles}, kernel_config = {kernel_config}, task_id = {task_id}, dependency = {dependency}")
         print(f"Attn Split Task: num_tiles = {num_split_tiles}, kernel_config = {kernel_config}, task_id = {task_id}, dependency = {dependency}, NUM_KV_SPLITS = {NUM_KV_SPLITS}")
         for i in range(num_split_tiles):
+            # tile → (batch, head_group, kv_split) 映射 (与 kernel 中一致)
+            bid = i // (head_blocks * NUM_KV_SPLITS)
+            hid = i % (head_blocks * NUM_KV_SPLITS) // NUM_KV_SPLITS
+            split_kv_id = i % NUM_KV_SPLITS
+            head_off = hid * BLOCK_H
+            heads_in_group = min(BLOCK_H, num_q_heads - head_off)
+
+            # 输出 partial_out[bid, head_off:head_off+heads_in_group, split_kv_id, :]
+            partial_desc = OutputTilingDesc(
+                start_indices=(bid, head_off, split_kv_id, 0),
+                tile_sizes=(1, heads_in_group, 1, v_head_dim))
+            # 输出 lse[bid, head_off:head_off+heads_in_group, split_kv_id] (3D→4D padded)
+            lse_desc = OutputTilingDesc(
+                start_indices=(bid, head_off, split_kv_id, 0),
+                tile_sizes=(1, heads_in_group, 1, 1))
+            outs_tile_mapping = {partial_out: partial_desc, lse: lse_desc}
+
             tasks.append(
                 cls._create_task(layer_id, task_id, i, num_split_tiles, kernel_config, dependency, io_tensors,
-                                 extra_params))
+                                 extra_params, outs_tile_mapping=outs_tile_mapping))
         return tasks
 
 
@@ -178,7 +195,29 @@ class AttnCombineTaskBuilder(TaskBuilderBase):
         tasks = []
         cls.log(f"Attn Combine Task: num_tiles = {num_combine_tile}, kernel_config = {kernel_config}, task_id = {task_id}, dependency = {dependency}")
         for i in range(num_combine_tile):
+            # tile → (batch, head) 映射
+            bid = i // num_q_heads
+            head = i % num_q_heads
+
+            # 输入 partial_out[batch, head, :, :] — 该 head 的所有 KV splits
+            partial_in_desc = InputDependencyDesc(
+                partial_out, require_full=False,
+                start_indices=(bid, head, 0, 0),
+                data_sizes=(1, 1, NUM_KV_SPLITS, v_head_dim))
+            # 输入 lse[batch, head, :]
+            lse_in_desc = InputDependencyDesc(
+                lse, require_full=False,
+                start_indices=(bid, head, 0, 0),
+                data_sizes=(1, 1, NUM_KV_SPLITS, 1))
+            inputs_dep = {partial_out: partial_in_desc, lse: lse_in_desc}
+
+            # 输出 attn_out[batch, 0, head, :]
+            out_desc = OutputTilingDesc(
+                start_indices=(bid, 0, head, 0),
+                tile_sizes=(1, 1, 1, v_head_dim))
+            outs_tile_mapping = {output: out_desc}
+
             tasks.append(
                 cls._create_task(layer_id, task_id, i, num_combine_tile, kernel_config, dependency, io_tensors,
-                                 extra_params))
+                                 extra_params, inputs_dep=inputs_dep, outs_tile_mapping=outs_tile_mapping))
         return tasks
