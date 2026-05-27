@@ -346,7 +346,8 @@ else:
     body = f"""\
 num_total_tasks = tl.load(num_tasks_per_wq)
 for i in range(MAX_TASKS):
-    cur_task_idx = tl.atomic_add(work_queue_start, 1)
+    with al.scope(core_mode="vector"):
+        cur_task_idx = tl.atomic_add(work_queue_start, 1)
     if cur_task_idx < num_total_tasks:
 {textwrap.indent(textwrap.dedent(task_exec_block), '        ')}
 """
