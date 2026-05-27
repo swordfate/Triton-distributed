@@ -184,71 +184,74 @@ def MEGA_TRITON_KERNEL(
     DEPEND_ENTRY_END_OFFSET = 5
     IO_TENSORS_OFFSET = 6
 
-{textwrap.indent(task_fetch_body.strip(), '    ')}
+{textwrap.indent(textwrap.dedent(task_fetch_body).strip(), '    ')}
 """
     return src, task_types_and_str
 
 
 def _make_npu_static_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
                                      scoreboard_wait_deps_task_type, load_before_wait_type):
-    """生成 NPU 静态调度 (per-SM queue) 的 task 循环体."""
-    prof_load_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-    prof_load_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-    prof_wait_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-    prof_wait_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-    prof_task_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-    prof_task_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    """生成 NPU 静态调度 (per-SM queue) 的 task 循环体. 所有行以 0 空格为基准缩进."""
+    # prof 字符串: 基准缩进 4 空格 (for 循环体层级), dedent+indent 后变为 8 空格
+    P0 = '' if enalbe_profiling else None  # 无 profiling 时 prof 变量不起作用
+    prof_load_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_load_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_wait_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_wait_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_task_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_task_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
 
     aic_cond = ' or '.join([f'(task_type=={x})' for x in aic])
 
-    body = f"""    num_tasks = tl.load(num_tasks_per_wq + sm_id)
-    offset = INT_PER_TASK * NUM_SMS
+    body = f"""\
+num_tasks = tl.load(num_tasks_per_wq + sm_id)
+offset = INT_PER_TASK * NUM_SMS
 
-    for i in range(num_tasks):
+for i in range(num_tasks):
 {prof_load_begin}\
-        task_type = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TASK_TYPE_OFFSET).to(tl.int32)
-        layer_id = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + LAYER_ID_OFFSET).to(tl.int32)
-        task_id = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TASK_ID_OFFSET).to(tl.int32)
-        tile_id_or_start = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TILE_ID_OR_START_OFFSET).to(tl.int32)
-        depend_entry_start = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + DEPEND_ENTRY_START_OFFSET).to(tl.int32)
-        depend_entry_end = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + DEPEND_ENTRY_END_OFFSET).to(tl.int32)
-        io_tensors_ptr = work_queues + i * offset + sm_id * INT_PER_TASK + IO_TENSORS_OFFSET
+    task_type = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TASK_TYPE_OFFSET).to(tl.int32)
+    layer_id = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + LAYER_ID_OFFSET).to(tl.int32)
+    task_id = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TASK_ID_OFFSET).to(tl.int32)
+    tile_id_or_start = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + TILE_ID_OR_START_OFFSET).to(tl.int32)
+    depend_entry_start = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + DEPEND_ENTRY_START_OFFSET).to(tl.int32)
+    depend_entry_end = tl.load(work_queues + i * offset + sm_id * INT_PER_TASK + DEPEND_ENTRY_END_OFFSET).to(tl.int32)
+    io_tensors_ptr = work_queues + i * offset + sm_id * INT_PER_TASK + IO_TENSORS_OFFSET
 
 {prof_load_end}\
 {prof_wait_begin}\
+    with al.scope(core_mode="vector"):
+        scoreboard_wait_deps_flat(
+            scoreboard_ptr,
+            task_deps_ptr,
+            depend_entry_start,
+            depend_entry_end,
+            INT_PER_DEPS=INT_PER_DEPS,
+            TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+            debug_counts=debug_counts,
+        )
+
+    # 访存保序
+    if ({aic_cond}) and (depend_entry_end > depend_entry_start):
         with al.scope(core_mode="vector"):
-            scoreboard_wait_deps_flat(
-                scoreboard_ptr,
-                task_deps_ptr,
-                depend_entry_start,
-                depend_entry_end,
-                INT_PER_DEPS=INT_PER_DEPS,
-                TILE_READY_SIGNAL=TILE_READY_SIGNAL,
-                debug_counts=debug_counts,
+            tl.sync_block_set('vector', 'cube', 5)
+        with al.scope(core_mode="cube"):
+            tl.sync_block_wait('vector', 'cube', 5)
+    else:
+        with al.scope(core_mode="vector"):
+            dummy = tl.arange(0, 1)
+            tl.inline_asm_elementwise(
+                asm="BAR.ALL",
+                constraints="=l,0",
+                args=[dummy],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
             )
 
-        # 访存保序
-        if ({aic_cond}) and (depend_entry_end > depend_entry_start):
-            with al.scope(core_mode="vector"):
-                tl.sync_block_set('vector', 'cube', 5)
-            with al.scope(core_mode="cube"):
-                tl.sync_block_wait('vector', 'cube', 5)
-        else:
-            with al.scope(core_mode="vector"):
-                dummy = tl.arange(0, 1)
-                tl.inline_asm_elementwise(
-                    asm="BAR.ALL",
-                    constraints="=l,0",
-                    args=[dummy],
-                    dtype=tl.int32,
-                    is_pure=False,
-                    pack=1,
-                )
-
 {prof_wait_end}\
-        #### run task ####
+    #### run task ####
 {prof_task_begin}\
-{textwrap.indent(tasks_dispatch_code.strip(), '        ')}
+{textwrap.indent(tasks_dispatch_code.strip(), '    ')}
 {prof_task_end}\
 """
     return body
@@ -257,7 +260,7 @@ def _make_npu_static_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
 def _make_npu_dynamic_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
                                       scoreboard_wait_deps_task_type, load_before_wait_type,
                                       enable_task_prefetch):
-    """生成 NPU 动态调度 (global flat queue + 原子竞争) 的 task 循环体.
+    """生成 NPU 动态调度 (global flat queue + 原子竞争) 的 task 循环体. 所有行以 0 空格为基准缩进.
 
     参考 main 分支 GPU 动态调度设计:
     - 所有 task 放入一个全局平面队列 (enque_tasks 时 num_sms=1)
@@ -270,87 +273,88 @@ def _make_npu_dynamic_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
     """
     aic_cond = ' or '.join([f'(task_type=={x})' for x in aic])
 
-    prof_load_begin = f'prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n        ' if enalbe_profiling else ''
-    prof_load_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-    prof_wait_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-    prof_wait_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-    prof_task_begin = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-    prof_task_end   = f'        prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    # prof 字符串: 基准缩进 4 空格 (while/for 循环体层级), 外层 dedent+indent 后变为 8 空格
+    prof_load_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_load_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_wait_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_wait_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_task_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+    prof_task_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
 
-    # 从全局平面队列加载单条 task 元数据 + 等待依赖 + 执行 + 释放
+    # 从全局平面队列加载单条 task 元数据 + 等待依赖 + 执行 + 释放 (0-base 缩进)
     task_exec_block = f"""\
 {prof_load_begin}\
-        task_type = tl.load(work_queues + cur_task_idx * INT_PER_TASK + TASK_TYPE_OFFSET).to(tl.int32)
-        layer_id = tl.load(work_queues + cur_task_idx * INT_PER_TASK + LAYER_ID_OFFSET).to(tl.int32)
-        task_id = tl.load(work_queues + cur_task_idx * INT_PER_TASK + TASK_ID_OFFSET).to(tl.int32)
-        tile_id_or_start = tl.load(work_queues + cur_task_idx * INT_PER_TASK + TILE_ID_OR_START_OFFSET).to(tl.int32)
-        depend_entry_start = tl.load(work_queues + cur_task_idx * INT_PER_TASK + DEPEND_ENTRY_START_OFFSET).to(tl.int32)
-        depend_entry_end = tl.load(work_queues + cur_task_idx * INT_PER_TASK + DEPEND_ENTRY_END_OFFSET).to(tl.int32)
-        io_tensors_ptr = work_queues + cur_task_idx * INT_PER_TASK + IO_TENSORS_OFFSET
+task_type = tl.load(work_queues + cur_task_idx * INT_PER_TASK + TASK_TYPE_OFFSET).to(tl.int32)
+layer_id = tl.load(work_queues + cur_task_idx * INT_PER_TASK + LAYER_ID_OFFSET).to(tl.int32)
+task_id = tl.load(work_queues + cur_task_idx * INT_PER_TASK + TASK_ID_OFFSET).to(tl.int32)
+tile_id_or_start = tl.load(work_queues + cur_task_idx * INT_PER_TASK + TILE_ID_OR_START_OFFSET).to(tl.int32)
+depend_entry_start = tl.load(work_queues + cur_task_idx * INT_PER_TASK + DEPEND_ENTRY_START_OFFSET).to(tl.int32)
+depend_entry_end = tl.load(work_queues + cur_task_idx * INT_PER_TASK + DEPEND_ENTRY_END_OFFSET).to(tl.int32)
+io_tensors_ptr = work_queues + cur_task_idx * INT_PER_TASK + IO_TENSORS_OFFSET
 
 {prof_load_end}\
 {prof_wait_begin}\
-        with al.scope(core_mode="vector"):
-            scoreboard_wait_deps_flat(
-                scoreboard_ptr,
-                task_deps_ptr,
-                depend_entry_start,
-                depend_entry_end,
-                INT_PER_DEPS=INT_PER_DEPS,
-                TILE_READY_SIGNAL=TILE_READY_SIGNAL,
-                debug_counts=debug_counts,
-            )
+with al.scope(core_mode="vector"):
+    scoreboard_wait_deps_flat(
+        scoreboard_ptr,
+        task_deps_ptr,
+        depend_entry_start,
+        depend_entry_end,
+        INT_PER_DEPS=INT_PER_DEPS,
+        TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+        debug_counts=debug_counts,
+    )
 
-        # 访存保序
-        if ({aic_cond}) and (depend_entry_end > depend_entry_start):
-            with al.scope(core_mode="vector"):
-                tl.sync_block_set('vector', 'cube', 5)
-            with al.scope(core_mode="cube"):
-                tl.sync_block_wait('vector', 'cube', 5)
-        else:
-            with al.scope(core_mode="vector"):
-                dummy = tl.arange(0, 1)
-                tl.inline_asm_elementwise(
-                    asm="BAR.ALL",
-                    constraints="=l,0",
-                    args=[dummy],
-                    dtype=tl.int32,
-                    is_pure=False,
-                    pack=1,
-                )
+# 访存保序
+if ({aic_cond}) and (depend_entry_end > depend_entry_start):
+    with al.scope(core_mode="vector"):
+        tl.sync_block_set('vector', 'cube', 5)
+    with al.scope(core_mode="cube"):
+        tl.sync_block_wait('vector', 'cube', 5)
+else:
+    with al.scope(core_mode="vector"):
+        dummy = tl.arange(0, 1)
+        tl.inline_asm_elementwise(
+            asm="BAR.ALL",
+            constraints="=l,0",
+            args=[dummy],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
 
 {prof_wait_end}\
-        #### run task ####
+#### run task ####
 {prof_task_begin}\
-{textwrap.indent(tasks_dispatch_code.strip(), '        ')}
+{textwrap.indent(tasks_dispatch_code.strip(), '    ')}
 {prof_task_end}\
 """
 
     if enable_task_prefetch:
-        # 预取下一个 task: 在执行当前 task 前先原子抢下一个, 隐藏取指延迟
-        body = f"""    num_total_tasks = tl.load(num_tasks_per_wq)  # 全局队列总 task 数
+        body = f"""\
+num_total_tasks = tl.load(num_tasks_per_wq)
+cur_task_idx = tl.atomic_add(work_queue_start, 1)
+if cur_task_idx >= num_total_tasks:
+    return
+# 第一个 task: 加载 + 执行
+{textwrap.indent(textwrap.dedent(task_exec_block), '    ')}
+
+while True:
     cur_task_idx = tl.atomic_add(work_queue_start, 1)
     if cur_task_idx >= num_total_tasks:
-        return
-    # 第一个 task: 加载 + 执行
-{textwrap.indent(task_exec_block, '    ')}
-
-    while True:
-        cur_task_idx = tl.atomic_add(work_queue_start, 1)
-        if cur_task_idx >= num_total_tasks:
-            break
-{textwrap.indent(task_exec_block, '        ')}
+        break
+{textwrap.indent(textwrap.dedent(task_exec_block), '    ')}
 """
     else:
-        # 无预取: while 循环内原子抢 task
-        body = f"""    num_total_tasks = tl.load(num_tasks_per_wq)  # 全局队列总 task 数
-    cur_task_idx = tl.atomic_add(work_queue_start, 1)
-    if cur_task_idx >= num_total_tasks:
-        return
+        body = f"""\
+num_total_tasks = tl.load(num_tasks_per_wq)
+cur_task_idx = tl.atomic_add(work_queue_start, 1)
+if cur_task_idx >= num_total_tasks:
+    return
 
-    while cur_task_idx < num_total_tasks:
-{textwrap.indent(task_exec_block, '        ')}
-        cur_task_idx = tl.atomic_add(work_queue_start, 1)
+while cur_task_idx < num_total_tasks:
+{textwrap.indent(textwrap.dedent(task_exec_block), '    ')}
+    cur_task_idx = tl.atomic_add(work_queue_start, 1)
 """
     return body
 
