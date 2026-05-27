@@ -885,6 +885,8 @@ class ModelBuilder:
         self._work_queue_start = torch.empty((1,), dtype=torch.int32, device=torch.cuda.current_device())
         if self._enable_runtime_scheduler:
             self._work_queue_start.fill_(0)
+        # 动态调度 for-range 上限 = 工作队列总 task 数 (tl.constexpr)
+        max_tasks = self.wq_tensor.shape[0] if self._enable_runtime_scheduler else None
         if self._enable_profiling:
             assert self.profile_buf is not None
             reset_profiler_buffer(self.profile_buf)
@@ -899,8 +901,7 @@ class ModelBuilder:
                 self.scoreboard,
                 self.task_deps_tensor,
             ]
-            self._gen_kernel[grid](
-                *kernel_args,
+            kwargs = dict(
                 INT_PER_DEPS=self.task_deps_tensor.shape[1],
                 INT_PER_TASK=self.wq_tensor.shape[2],
                 MAX_TASK_ID=self.scoreboard.shape[1],
@@ -910,6 +911,9 @@ class ModelBuilder:
                 num_warps=self.num_warps,
                 debug_counts=debug_counts,
             )
+            if self._enable_runtime_scheduler:
+                kwargs['MAX_TASKS'] = max_tasks
+            self._gen_kernel[grid](*kernel_args, **kwargs)
         else:
             kernel_args = []
             if self._enable_runtime_scheduler:
@@ -920,8 +924,7 @@ class ModelBuilder:
                 self.scoreboard,
                 self.task_deps_tensor,
             ]
-            self._gen_kernel[grid](
-                *kernel_args,
+            kwargs = dict(
                 INT_PER_DEPS=self.task_deps_tensor.shape[1],
                 INT_PER_TASK=self.wq_tensor.shape[2],
                 MAX_TASK_ID=self.scoreboard.shape[1],
@@ -931,6 +934,9 @@ class ModelBuilder:
                 num_warps=self.num_warps,
                 debug_counts=debug_counts,
             )
+            if self._enable_runtime_scheduler:
+                kwargs['MAX_TASKS'] = max_tasks
+            self._gen_kernel[grid](*kernel_args, **kwargs)
         # print(f'scoreboard end run magekernel: {self.scoreboard}')
         # print(f'debug_counts end run magekernel: {debug_counts}')
         # is_valid = self.check_dependencies_nonzero(debug_counts, self.task_deps_tensor)

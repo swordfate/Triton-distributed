@@ -107,11 +107,11 @@ def MEGA_TRITON_KERNEL(
         if enable_runtime_scheduler:
             # ===================================================================
             # 动态调度模式: 所有 task 放入一个全局平面队列 (num_sms=1),
-            # 每个 SM 通过原子操作竞争获取下一个 task, 空闲 SM 自动承接更多工作.
-            # 参考 main 分支 GPU 动态调度设计, 适配 Ascend NPU.
+            # 每个 SM 通过 atomic_add 竞争获取下一个 task, 空闲 SM 自动承接更多工作.
+            # Ascend 适配: while+atomic_add 导致 Bisheng SIGSEGV, 改用 for-range.
             # ===================================================================
             work_queue_start_param = "work_queue_start, # [1,] int32 全局原子计数器"
-            # 动态调度: 每个 SM 先原子抢第一个 task
+            max_tasks_param = "MAX_TASKS: tl.constexpr,"
             task_fetch_body = _make_npu_dynamic_scheduler_body(
                 aic=aic,
                 enalbe_profiling=enalbe_profiling,
@@ -125,6 +125,7 @@ def MEGA_TRITON_KERNEL(
             # 静态调度模式: 每个 SM 有固定的 per-SM 工作队列 (round-robin 预分配)
             # ===================================================================
             work_queue_start_param = ""
+            max_tasks_param = ""
             task_fetch_body = _make_npu_static_scheduler_body(
                 aic=aic,
                 enalbe_profiling=enalbe_profiling,
@@ -163,6 +164,7 @@ def MEGA_TRITON_KERNEL(
     MAX_NUM_TILES_PER_OP: tl.constexpr,
     MAX_NUM_TENSOR_DIMS: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    {max_tasks_param}
     num_warps: tl.constexpr,
     debug_counts,
 ):
@@ -273,9 +275,8 @@ def _make_npu_dynamic_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
     - 空闲 SM 自动承接更多工作, 消除静态预分配导致的负载不均
 
     Ascend 适配:
-    - atomic_add sem 仅支持 acq_rel, scope 仅支持 gpu → 使用默认值, 不显式传参
-    - atomic_add 支持 int32 类型, 可在 loop 中使用
-    - 注意: atomic_cas / atomic_xchg 等不支持在 loop 中使用
+    - while+atomic_add → Bisheng SIGSEGV, 改用 for i in range(MAX_TASKS) 计数循环
+    - atomic_add sem/scope 用默认值 acq_rel+gpu, 支持 int32, 有返回值
     """
     # Triton 不支持 flat chained or, 必须嵌套括号: (A or (B or (C or D)))
     _parts = [f'(task_type=={x})' for x in aic]
@@ -283,16 +284,13 @@ def _make_npu_dynamic_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
     for p in _parts[1:]:
         aic_cond = f'({aic_cond} or {p})'
 
-    # prof 字符串: 基准缩进 4 空格 (while/for 循环体层级), 外层 dedent+indent 后变为 8 空格
+    # prof 字符串: 基准缩进 4 空格 (for 循环体层级), 外层 dedent+indent 后变为 8 空格
     prof_load_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
     prof_load_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
     prof_wait_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
     prof_wait_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
     prof_task_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
     prof_task_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
-
-    # Ascend tl.atomic_add: 默认 sem="acq_rel" scope="gpu", 返回旧值 (int32 支持)
-    fetch_next_task = 'cur_task_idx = tl.atomic_add(work_queue_start, 1)'
 
     # 从全局平面队列加载单条 task 元数据 + 等待依赖 + 执行 + 释放 (0-base 缩进)
     task_exec_block = f"""\
@@ -343,31 +341,14 @@ else:
 {prof_task_end}\
 """
 
-    if enable_task_prefetch:
-        body = f"""\
+    # Ascend: while+atomic_add → Bisheng SIGSEGV, 改用 for-range 计数循环
+    # for i in range(MAX_TASKS) 在 Triton IR 中生成 counted loop, Bisheng 可正确编译
+    body = f"""\
 num_total_tasks = tl.load(num_tasks_per_wq)
-{fetch_next_task}
-if cur_task_idx >= num_total_tasks:
-    return
-# 第一个 task: 加载 + 执行
-{textwrap.indent(textwrap.dedent(task_exec_block), '    ')}
-
-while True:
-{textwrap.indent(fetch_next_task, '    ')}
-    if cur_task_idx >= num_total_tasks:
-        break
-{textwrap.indent(textwrap.dedent(task_exec_block), '    ')}
-"""
-    else:
-        body = f"""\
-num_total_tasks = tl.load(num_tasks_per_wq)
-{fetch_next_task}
-if cur_task_idx >= num_total_tasks:
-    return
-
-while cur_task_idx < num_total_tasks:
-{textwrap.indent(textwrap.dedent(task_exec_block), '    ')}
-{textwrap.indent(fetch_next_task, '    ')}
+for i in range(MAX_TASKS):
+    cur_task_idx = tl.atomic_add(work_queue_start, 1)
+    if cur_task_idx < num_total_tasks:
+{textwrap.indent(textwrap.dedent(task_exec_block), '        ')}
 """
     return body
 
