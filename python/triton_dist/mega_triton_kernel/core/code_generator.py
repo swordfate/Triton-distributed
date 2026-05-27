@@ -268,12 +268,14 @@ def _make_npu_dynamic_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
 
     参考 main 分支 GPU 动态调度设计:
     - 所有 task 放入一个全局平面队列 (enque_tasks 时 num_sms=1)
-    - 每个 SM 通过 tl.atomic_add 原子抢下一个 task 索引
+    - 每个 SM 通过 tl.atomic_add 原子抢下一个 task 索引, 返回旧值作为 task 编号
     - work_queue_start 是全局原子计数器 (单元素 int32 tensor)
     - 空闲 SM 自动承接更多工作, 消除静态预分配导致的负载不均
 
-    注: 动态调度依赖 Ascend NPU 硬件支持 tl.atomic_add 跨 SM 原子操作.
-        如不可用, 需通过软件方法 (如 scoreboard 锁) 实现类似效果.
+    Ascend 适配:
+    - atomic_add sem 仅支持 acq_rel, scope 仅支持 gpu → 使用默认值, 不显式传参
+    - atomic_add 支持 int32 类型, 可在 loop 中使用
+    - 注意: atomic_cas / atomic_xchg 等不支持在 loop 中使用
     """
     # Triton 不支持 flat chained or, 必须嵌套括号: (A or (B or (C or D)))
     _parts = [f'(task_type=={x})' for x in aic]
@@ -288,6 +290,9 @@ def _make_npu_dynamic_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
     prof_wait_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type={scoreboard_wait_deps_task_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
     prof_task_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
     prof_task_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
+
+    # Ascend tl.atomic_add: 默认 sem="acq_rel" scope="gpu", 返回旧值 (int32 支持)
+    fetch_next_task = 'cur_task_idx = tl.atomic_add(work_queue_start, 1)'
 
     # 从全局平面队列加载单条 task 元数据 + 等待依赖 + 执行 + 释放 (0-base 缩进)
     task_exec_block = f"""\
@@ -341,14 +346,14 @@ else:
     if enable_task_prefetch:
         body = f"""\
 num_total_tasks = tl.load(num_tasks_per_wq)
-cur_task_idx = tl.atomic_add(work_queue_start, 1)
+{fetch_next_task}
 if cur_task_idx >= num_total_tasks:
     return
 # 第一个 task: 加载 + 执行
 {textwrap.indent(textwrap.dedent(task_exec_block), '    ')}
 
 while True:
-    cur_task_idx = tl.atomic_add(work_queue_start, 1)
+{textwrap.indent(fetch_next_task, '    ')}
     if cur_task_idx >= num_total_tasks:
         break
 {textwrap.indent(textwrap.dedent(task_exec_block), '    ')}
@@ -356,13 +361,13 @@ while True:
     else:
         body = f"""\
 num_total_tasks = tl.load(num_tasks_per_wq)
-cur_task_idx = tl.atomic_add(work_queue_start, 1)
+{fetch_next_task}
 if cur_task_idx >= num_total_tasks:
     return
 
 while cur_task_idx < num_total_tasks:
 {textwrap.indent(textwrap.dedent(task_exec_block), '    ')}
-    cur_task_idx = tl.atomic_add(work_queue_start, 1)
+{textwrap.indent(fetch_next_task, '    ')}
 """
     return body
 
