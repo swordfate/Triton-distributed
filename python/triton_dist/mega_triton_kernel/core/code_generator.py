@@ -201,7 +201,11 @@ def _make_npu_static_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
     prof_task_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
     prof_task_end   = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=0, task_type=task_type, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
 
-    aic_cond = ' or '.join([f'(task_type=={x})' for x in aic])
+    # Triton 不支持 flat chained or, 必须嵌套括号: (A or (B or (C or D)))
+    _parts = [f'(task_type=={x})' for x in aic]
+    aic_cond = _parts[0]
+    for p in _parts[1:]:
+        aic_cond = f'({aic_cond} or {p})'
 
     body = f"""\
 num_tasks = tl.load(num_tasks_per_wq + sm_id)
@@ -271,7 +275,11 @@ def _make_npu_dynamic_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
     注: 动态调度依赖 Ascend NPU 硬件支持 tl.atomic_add 跨 SM 原子操作.
         如不可用, 需通过软件方法 (如 scoreboard 锁) 实现类似效果.
     """
-    aic_cond = ' or '.join([f'(task_type=={x})' for x in aic])
+    # Triton 不支持 flat chained or, 必须嵌套括号: (A or (B or (C or D)))
+    _parts = [f'(task_type=={x})' for x in aic]
+    aic_cond = _parts[0]
+    for p in _parts[1:]:
+        aic_cond = f'({aic_cond} or {p})'
 
     # prof 字符串: 基准缩进 4 空格 (while/for 循环体层级), 外层 dedent+indent 后变为 8 空格
     prof_load_begin = f'    prof_offset = record_event(prof_base_ptr, prof_offset, prof_stride, sm_id, 0, 1, is_start=1, task_type={load_before_wait_type}, ENABLE_PROFILING=True)\n' if enalbe_profiling else ''
