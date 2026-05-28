@@ -338,18 +338,19 @@ else:
 {prof_task_end}\
 """
 
-    # chunk 调度: atomic_add 在循环外只调一次抢 chunk, 循环内零原子操作
-    # DEMO 13/14 验证: 8/8 SM 参与, 分布均匀, missing=0, 无 hang
+    # chunk 调度: atomic_add 抢 chunk, for-range 用范围 0..chunk_size (和静态
+    # 调度一样的 range(end) 结构), 内部加 my_start 偏移.
+    # 注意: range(my_start, my_end) 带双参数在 Triton IR 中生成 while-like 结构,
+    # 会触发 Bisheng SIGSEGV; 必须用 range(chunk_size) + 内部偏移.
     body = f"""\
 num_total_tasks = tl.load(num_tasks_per_wq)
 chunk_size = (num_total_tasks + NUM_SMS - 1) // NUM_SMS
 with al.scope(core_mode="vector"):
     my_start = tl.atomic_add(work_queue_start, chunk_size)
 if my_start < num_total_tasks:
-    my_end = my_start + chunk_size
-    if my_end > num_total_tasks:
-        my_end = num_total_tasks
-    for cur_task_idx in range(my_start, my_end):
+    for i in range(chunk_size):
+        cur_task_idx = my_start + i
+        if cur_task_idx < num_total_tasks:
 {textwrap.indent(textwrap.dedent(task_exec_block), '        ')}
 """
     return body
