@@ -82,22 +82,28 @@ def mlp_fc2_config_factory(**kwargs) -> MLPFC2Config:
 
 
 def _make_npu_linear_inline_code(BLOCK_SIZE_M, BLOCK_SIZE_N, SUB_BLOCK_SIZE_N, BLOCK_SIZE_K, NUM_STAGES):
-    """生成 NPU 线性 kernel 的内联展开代码, 替代 JIT 函数调用 (避免 triton-ascend 函数内联 bug 导致 CCU 错误)."""
+    """生成 NPU 线性 kernel 的内联展开代码, 完全对齐原始 tensor_desc_data_ptr/tensor_desc_size/fc1_task_compute 逻辑."""
     return f"""
 with al.scope(core_mode="cube"):
     IPT = MAX_NUM_TENSOR_DIMS + 2
+    # ---- tensor_desc_data_ptr(a, bfloat16) + tl.multiple_of(16) ----
     a_lo = tl.load(io_tensors_ptr + 0*IPT + 0)
     a_hi = tl.load(io_tensors_ptr + 0*IPT + 1)
     a_ptr = ((a_hi.to(tl.uint64) << 32) | (a_lo.to(tl.uint64) & 0xFFFFFFFF)).to(tl.pointer_type(tl.bfloat16))
+    a_ptr = tl.multiple_of(a_ptr, 16)
     b_lo = tl.load(io_tensors_ptr + 1*IPT + 0)
     b_hi = tl.load(io_tensors_ptr + 1*IPT + 1)
     b_ptr = ((b_hi.to(tl.uint64) << 32) | (b_lo.to(tl.uint64) & 0xFFFFFFFF)).to(tl.pointer_type(tl.bfloat16))
+    b_ptr = tl.multiple_of(b_ptr, 16)
     c_lo = tl.load(io_tensors_ptr + 2*IPT + 0)
     c_hi = tl.load(io_tensors_ptr + 2*IPT + 1)
     c_ptr = ((c_hi.to(tl.uint64) << 32) | (c_lo.to(tl.uint64) & 0xFFFFFFFF)).to(tl.pointer_type(tl.bfloat16))
+    c_ptr = tl.multiple_of(c_ptr, 16)
+    # ---- tensor_desc_size(input,0), tensor_desc_size(input,1,16), tensor_desc_size(weight,0) ----
     M = tl.load(io_tensors_ptr + 0*IPT + 2).to(tl.int32)
-    K = tl.load(io_tensors_ptr + 0*IPT + 3).to(tl.int32)
+    K = tl.multiple_of(tl.load(io_tensors_ptr + 0*IPT + 3).to(tl.int32), 16)
     N = tl.load(io_tensors_ptr + 1*IPT + 2).to(tl.int32)
+    # ---- tile_wise_matmul_compute (内联) ----
     tile_id = tile_id_or_start
     num_pid_n = tl.cdiv(N, {BLOCK_SIZE_N})
     pid_m = tile_id // num_pid_n
@@ -121,10 +127,11 @@ with al.scope(core_mode="cube"):
         offs_cn = start_n + tl.arange(0, {SUB_BLOCK_SIZE_N})
         c_ptrs = c_ptr + N * offs_cm[:, None] + offs_cn[None, :]
         tl.store(c_ptrs, accumulator.to(tl.bfloat16))
+# ---- fc1_task_compute 的 cube→vector sync (id=11) + scoreboard release ----
 with al.scope(core_mode="cube"):
-    tl.sync_block_set('cube', 'vector', 10)
+    tl.sync_block_set('cube', 'vector', 11)
 with al.scope(core_mode="vector"):
-    tl.sync_block_wait('cube', 'vector', 10)
+    tl.sync_block_wait('cube', 'vector', 11)
 scoreboard_release_tile_flat(
     scoreboard_ptr=scoreboard_ptr,
     layer_id=layer_id,
