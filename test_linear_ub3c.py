@@ -61,35 +61,31 @@ def megakernel_minimal(
             N = tl.load(io_tensors_ptr + 2*IPT + 3).to(tl.int32)  # c.shape[1]
 
             tile_id = tile_id_or_start
-            BM = BLOCK_SIZE_M
-            BN = BLOCK_SIZE_N
-            SUB = SUB_BLOCK_SIZE_N
-            BK = BLOCK_SIZE_K
 
-            num_pid_n = tl.cdiv(N, BN)
+            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
             pid_m = tile_id // num_pid_n
             pid_n = tile_id % num_pid_n
-            start_m = pid_m * BM
-            base_start_n = pid_n * BN
+            start_m = pid_m * BLOCK_SIZE_M
+            base_start_n = pid_n * BLOCK_SIZE_N
 
-            offs_am = start_m + tl.arange(0, BM)
-            k_tiles = tl.cdiv(K, BK)
+            offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
+            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
 
-            for sub_i in tl.range(0, BN, SUB, num_stages=NUM_STAGES):
+            for sub_i in tl.range(0, BLOCK_SIZE_N, SUB_BLOCK_SIZE_N, num_stages=NUM_STAGES):
                 start_n = base_start_n + sub_i
-                offs_bn = start_n + tl.arange(0, SUB)
+                offs_bn = start_n + tl.arange(0, SUB_BLOCK_SIZE_N)
 
-                accumulator = tl.zeros((BM, SUB), dtype=tl.float32)
+                accumulator = tl.zeros((BLOCK_SIZE_M, SUB_BLOCK_SIZE_N), dtype=tl.float32)
                 for ki in range(k_tiles):
-                    offs_k = ki * BK + tl.arange(0, BK)
+                    offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
                     a_ptrs = a_ptr + (offs_am[:, None] * K + offs_k[None, :])
                     b_ptrs = b_ptr + (offs_bn[:, None] * K + offs_k[None, :])
                     a = tl.load(a_ptrs)
                     b = tl.load(b_ptrs)
                     accumulator = tl.dot(a, b.T, accumulator)
 
-                offs_cm = pid_m * BM + tl.arange(0, BM)
-                offs_cn = start_n + tl.arange(0, SUB)
+                offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+                offs_cn = start_n + tl.arange(0, SUB_BLOCK_SIZE_N)
                 c_ptrs = c_ptr + N * offs_cm[:, None] + offs_cn[None, :]
                 tl.store(c_ptrs, accumulator.to(tl.bfloat16))
 
