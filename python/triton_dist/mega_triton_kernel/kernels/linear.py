@@ -32,7 +32,9 @@ def tile_wise_matmul_compute(tile_id, a_ptr, b_ptr, c_ptr,
 
     # --- 2. 新增的 N 维度切片循环 ---
     # 分批算 SUB_BLOCK_SIZE_N
-    for i in tl.range(0, BLOCK_SIZE_N, SUB_BLOCK_SIZE_N, num_stages=NUM_STAGES):
+    # Ascend: num_stages/disallow_acc_multi_buffer 不生效, 编译器对 dot 累加器
+    # 做不受控多缓冲 → CCU 输入缓存溢出. 显式 num_stages=1 + 禁止多缓冲.
+    for i in tl.range(0, BLOCK_SIZE_N, SUB_BLOCK_SIZE_N, num_stages=1, disallow_acc_multi_buffer=True):
         # start_n = base_start_n + i
 
         # offs = tl.arange(0, BLOCK_SIZE_M * SUB_BLOCK_SIZE_N)
