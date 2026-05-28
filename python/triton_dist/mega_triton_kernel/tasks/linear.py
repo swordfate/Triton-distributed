@@ -251,16 +251,9 @@ class LinearTaskBaseBuilder(TaskBuilderBase):
         BLOCK_SIZE_K = 320
         num_tiles_m = cdiv(M, BLOCK_SIZE_M)
         
-        # Ascend UB 安全上限: 累加器 fp32[BLOCK_M, SUB] × 多缓冲份数 是 UB 大头.
-        # num_stages 和 disallow_acc_multi_buffer 在 Ascend 上不生效,
-        # 编译器可能对 dot 累加器做不受控的多缓冲 → sub>320 时累加器+load2d 超过 192KB UB.
-        # 限制 SUB_BLOCK_SIZE_N ≤ 320 (3-way 缓冲安全) / ≤ 256 (4-way 缓冲安全).
-        MAX_SUB_N = 320  # UB 安全上限: 保守取 320, 必要时可降到 256
-        start_i = (416 - MAX_SUB_N) // 16  # 跳过 >MAX_SUB_N 的候选值
-
         best_i = 0
         max_use = 0
-        for i in range(start_i, 26):
+        for i in range(26):
             SUB_BLOCK_SIZE_N = 416 - i * 16
             num_sub_tiles_n = cdiv(N, SUB_BLOCK_SIZE_N)
             num_sub_tiles = num_tiles_m * num_sub_tiles_n
