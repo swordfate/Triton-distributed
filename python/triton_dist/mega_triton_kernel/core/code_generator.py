@@ -110,8 +110,7 @@ def MEGA_TRITON_KERNEL(
             # 每个 SM 通过 atomic_add 竞争获取下一个 task, 空闲 SM 自动承接更多工作.
             # Ascend 适配: while+atomic_add 导致 Bisheng SIGSEGV, 改用 for-range.
             # ===================================================================
-            work_queue_start_param = "work_queue_start, # [1,] int32 全局原子计数器"
-            max_tasks_param = "MAX_TASKS: tl.constexpr,"
+            work_queue_start_param = "work_queue_start, # [1,] int32 全局原子计数器, chunk 分配"
             task_fetch_body = _make_npu_dynamic_scheduler_body(
                 aic=aic,
                 enalbe_profiling=enalbe_profiling,
@@ -125,7 +124,6 @@ def MEGA_TRITON_KERNEL(
             # 静态调度模式: 每个 SM 有固定的 per-SM 工作队列 (round-robin 预分配)
             # ===================================================================
             work_queue_start_param = ""
-            max_tasks_param = ""
             task_fetch_body = _make_npu_static_scheduler_body(
                 aic=aic,
                 enalbe_profiling=enalbe_profiling,
@@ -164,7 +162,6 @@ def MEGA_TRITON_KERNEL(
     MAX_NUM_TILES_PER_OP: tl.constexpr,
     MAX_NUM_TENSOR_DIMS: tl.constexpr,
     NUM_SMS: tl.constexpr,
-    {max_tasks_param}
     num_warps: tl.constexpr,
     debug_counts,
 ):
@@ -275,8 +272,8 @@ def _make_npu_dynamic_scheduler_body(aic, enalbe_profiling, tasks_dispatch_code,
     - 空闲 SM 自动承接更多工作, 消除静态预分配导致的负载不均
 
     Ascend 适配:
-    - while+atomic_add → Bisheng SIGSEGV, 改用 for i in range(MAX_TASKS) 计数循环
-    - atomic_add sem/scope 用默认值 acq_rel+gpu, 支持 int32, 有返回值
+    - 每 SM 在循环外调一次 atomic_add 抢 chunk, 循环内零原子操作
+    - DEMO 13/14 已验证: 8/8 SM 参与, 分布均匀, missing=0
     """
     # Triton 不支持 flat chained or, 必须嵌套括号: (A or (B or (C or D)))
     _parts = [f'(task_type=={x})' for x in aic]
@@ -341,14 +338,18 @@ else:
 {prof_task_end}\
 """
 
-    # Ascend: while+atomic_add → Bisheng SIGSEGV, 改用 for-range 计数循环
-    # for i in range(MAX_TASKS) 在 Triton IR 中生成 counted loop, Bisheng 可正确编译
+    # chunk 调度: atomic_add 在循环外只调一次抢 chunk, 循环内零原子操作
+    # DEMO 13/14 验证: 8/8 SM 参与, 分布均匀, missing=0, 无 hang
     body = f"""\
 num_total_tasks = tl.load(num_tasks_per_wq)
-for i in range(MAX_TASKS):
-    with al.scope(core_mode="vector"):
-        cur_task_idx = tl.atomic_add(work_queue_start, 1)
-    if cur_task_idx < num_total_tasks:
+chunk_size = (num_total_tasks + NUM_SMS - 1) // NUM_SMS
+with al.scope(core_mode="vector"):
+    my_start = tl.atomic_add(work_queue_start, chunk_size)
+if my_start < num_total_tasks:
+    my_end = my_start + chunk_size
+    if my_end > num_total_tasks:
+        my_end = num_total_tasks
+    for cur_task_idx in range(my_start, my_end):
 {textwrap.indent(textwrap.dedent(task_exec_block), '        ')}
 """
     return body

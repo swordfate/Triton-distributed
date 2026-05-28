@@ -885,8 +885,6 @@ class ModelBuilder:
         self._work_queue_start = torch.empty((1,), dtype=torch.int32, device=torch.cuda.current_device())
         if self._enable_runtime_scheduler:
             self._work_queue_start.fill_(0)
-        # 动态调度 for-range 上限 = 工作队列总 task 数 (tl.constexpr)
-        max_tasks = self.wq_tensor.shape[0] if self._enable_runtime_scheduler else None
         if self._enable_profiling:
             assert self.profile_buf is not None
             reset_profiler_buffer(self.profile_buf)
@@ -911,8 +909,6 @@ class ModelBuilder:
                 num_warps=self.num_warps,
                 debug_counts=debug_counts,
             )
-            if self._enable_runtime_scheduler:
-                kwargs['MAX_TASKS'] = max_tasks
             self._gen_kernel[grid](*kernel_args, **kwargs)
         else:
             kernel_args = []
@@ -934,8 +930,6 @@ class ModelBuilder:
                 num_warps=self.num_warps,
                 debug_counts=debug_counts,
             )
-            if self._enable_runtime_scheduler:
-                kwargs['MAX_TASKS'] = max_tasks
             self._gen_kernel[grid](*kernel_args, **kwargs)
         # print(f'scoreboard end run magekernel: {self.scoreboard}')
         # print(f'debug_counts end run magekernel: {debug_counts}')
