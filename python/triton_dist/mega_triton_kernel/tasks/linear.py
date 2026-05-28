@@ -271,8 +271,14 @@ class LinearTaskBaseBuilder(TaskBuilderBase):
         num_sub_tiles_n = cdiv(N, SUB_BLOCK_SIZE_N)
         num_sub_tiles = num_tiles_m * num_sub_tiles_n
         sub_blocks = cdiv(num_sub_tiles, num_sm)
-        
+
         BLOCK_SIZE_N = SUB_BLOCK_SIZE_N * sub_blocks
+        # UB 安全上限: 限制单 tile 的 N 维度, 防止软件流水阶段过多导致
+        # mte load2d 写入地址超出 UB 范围 (CCU 错误 0x6203000053)
+        # 192KB UB, 每 stage 约需 SUB_BLOCK_SIZE_N*BLOCK_SIZE_K*2 + M*K*2 + M*SUB*4 字节
+        MAX_SUB_BLOCKS_PER_TILE = 4
+        if sub_blocks > MAX_SUB_BLOCKS_PER_TILE:
+            BLOCK_SIZE_N = SUB_BLOCK_SIZE_N * MAX_SUB_BLOCKS_PER_TILE
         num_tiles_n = cdiv(N, BLOCK_SIZE_N)
         num_tiles = num_tiles_m * num_tiles_n
 
