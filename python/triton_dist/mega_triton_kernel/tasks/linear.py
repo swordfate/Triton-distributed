@@ -81,56 +81,58 @@ def mlp_fc2_config_factory(**kwargs) -> MLPFC2Config:
     return MLPFC2Config(**default)
 
 
-def _make_npu_linear_inline_code(BLOCK_SIZE_M, BLOCK_SIZE_N, SUB_BLOCK_SIZE_N, BLOCK_SIZE_K, NUM_STAGES):
-    """生成 NPU 线性 kernel 的内联展开代码, 完全对齐原始 tensor_desc_data_ptr/tensor_desc_size/fc1_task_compute 逻辑."""
+def _make_npu_fc1_inline_code(BLOCK_SIZE_M, BLOCK_SIZE_N, SUB_BLOCK_SIZE_N, BLOCK_SIZE_K, NUM_STAGES):
+    """展开 fc1_task_compute 的 task_base_info_get_tensor, 其余调用不动. (sync id=11, K align=16)"""
     return f"""
 IPT = MAX_NUM_TENSOR_DIMS + 2
-# ---- tensor_desc_data_ptr(a, bfloat16) + tl.multiple_of(16) ----
-a_lo = tl.load(io_tensors_ptr + 0*IPT + 0)
-a_hi = tl.load(io_tensors_ptr + 0*IPT + 1)
-a_ptr = ((a_hi.to(tl.uint64) << 32) | (a_lo.to(tl.uint64) & 0xFFFFFFFF)).to(tl.pointer_type(tl.bfloat16))
-a_ptr = tl.multiple_of(a_ptr, 16)
-b_lo = tl.load(io_tensors_ptr + 1*IPT + 0)
-b_hi = tl.load(io_tensors_ptr + 1*IPT + 1)
-b_ptr = ((b_hi.to(tl.uint64) << 32) | (b_lo.to(tl.uint64) & 0xFFFFFFFF)).to(tl.pointer_type(tl.bfloat16))
-b_ptr = tl.multiple_of(b_ptr, 16)
-c_lo = tl.load(io_tensors_ptr + 2*IPT + 0)
-c_hi = tl.load(io_tensors_ptr + 2*IPT + 1)
-c_ptr = ((c_hi.to(tl.uint64) << 32) | (c_lo.to(tl.uint64) & 0xFFFFFFFF)).to(tl.pointer_type(tl.bfloat16))
-c_ptr = tl.multiple_of(c_ptr, 16)
-# ---- tensor_desc_size(input,0), tensor_desc_size(input,1,16), tensor_desc_size(weight,0) ----
-M = tl.load(io_tensors_ptr + 0*IPT + 2).to(tl.int32)
-K = tl.multiple_of(tl.load(io_tensors_ptr + 0*IPT + 3).to(tl.int32), 16)
-N = tl.load(io_tensors_ptr + 1*IPT + 2).to(tl.int32)
-# ---- tile_wise_matmul_compute (内联) ----
+input = io_tensors_ptr + 0 * IPT
+weight = io_tensors_ptr + 1 * IPT
+output = io_tensors_ptr + 2 * IPT
+M = tensor_desc_size(input, 0)
+K = tensor_desc_size(input, 1, 16)
+N = tensor_desc_size(weight, 0)
+a_ptr = tensor_desc_data_ptr(input, tl.bfloat16)
+b_ptr = tensor_desc_data_ptr(weight, tl.bfloat16)
+c_ptr = tensor_desc_data_ptr(output, tl.bfloat16)
 tile_id = tile_id_or_start
-num_pid_n = tl.cdiv(N, {BLOCK_SIZE_N})
-pid_m = tile_id // num_pid_n
-pid_n = tile_id % num_pid_n
-start_m = pid_m * {BLOCK_SIZE_M}
-base_start_n = pid_n * {BLOCK_SIZE_N}
-offs_am = start_m + tl.arange(0, {BLOCK_SIZE_M})
-k_tiles = tl.cdiv(K, {BLOCK_SIZE_K})
-for sub_i in tl.range(0, {BLOCK_SIZE_N}, {SUB_BLOCK_SIZE_N}, num_stages={NUM_STAGES}):
-    start_n = base_start_n + sub_i
-    offs_bn = start_n + tl.arange(0, {SUB_BLOCK_SIZE_N})
-    accumulator = tl.zeros(({BLOCK_SIZE_M}, {SUB_BLOCK_SIZE_N}), dtype=tl.float32)
-    for ki in range(k_tiles):
-        offs_k = ki * {BLOCK_SIZE_K} + tl.arange(0, {BLOCK_SIZE_K})
-        a_ptrs = a_ptr + (offs_am[:, None] * K + offs_k[None, :])
-        b_ptrs = b_ptr + (offs_bn[:, None] * K + offs_k[None, :])
-        a = tl.load(a_ptrs)
-        b = tl.load(b_ptrs)
-        accumulator = tl.dot(a, b.T, accumulator)
-    offs_cm = pid_m * {BLOCK_SIZE_M} + tl.arange(0, {BLOCK_SIZE_M})
-    offs_cn = start_n + tl.arange(0, {SUB_BLOCK_SIZE_N})
-    c_ptrs = c_ptr + N * offs_cm[:, None] + offs_cn[None, :]
-    tl.store(c_ptrs, accumulator.to(tl.bfloat16))
-# ---- fc1_task_compute 的 cube→vector sync (id=11) + scoreboard release ----
+tile_wise_matmul_compute(tile_id, a_ptr, b_ptr, c_ptr, M, N, K,
+    {BLOCK_SIZE_M}, {BLOCK_SIZE_N}, {SUB_BLOCK_SIZE_N}, {BLOCK_SIZE_K}, {NUM_STAGES})
 with al.scope(core_mode="cube"):
     tl.sync_block_set('cube', 'vector', 11)
 with al.scope(core_mode="vector"):
     tl.sync_block_wait('cube', 'vector', 11)
+scoreboard_release_tile_flat(
+    scoreboard_ptr=scoreboard_ptr,
+    layer_id=layer_id,
+    task_id=task_id,
+    tile_id=tile_id_or_start,
+    TILE_READY_SIGNAL=TILE_READY_SIGNAL,
+    MAX_TASK_ID=MAX_TASK_ID,
+    MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP
+)
+"""
+
+
+def _make_npu_linear_task_inline_code(BLOCK_SIZE_M, BLOCK_SIZE_N, SUB_BLOCK_SIZE_N, BLOCK_SIZE_K, NUM_STAGES, ALIGNMENT_K):
+    """展开 linear_task_compute, 保留 ALIGNMENT_K 参数. (sync id=10)"""
+    return f"""
+IPT = MAX_NUM_TENSOR_DIMS + 2
+input = io_tensors_ptr + 0 * IPT
+weight = io_tensors_ptr + 1 * IPT
+output = io_tensors_ptr + 2 * IPT
+M = tensor_desc_size(input, 0)
+K = tensor_desc_size(input, 1, {ALIGNMENT_K})
+N = tensor_desc_size(weight, 0)
+a_ptr = tensor_desc_data_ptr(input, tl.bfloat16)
+b_ptr = tensor_desc_data_ptr(weight, tl.bfloat16)
+c_ptr = tensor_desc_data_ptr(output, tl.bfloat16)
+tile_id = tile_id_or_start
+tile_wise_matmul_compute(tile_id, a_ptr, b_ptr, c_ptr, M, N, K,
+    {BLOCK_SIZE_M}, {BLOCK_SIZE_N}, {SUB_BLOCK_SIZE_N}, {BLOCK_SIZE_K}, {NUM_STAGES})
+with al.scope(core_mode="cube"):
+    tl.sync_block_set('cube', 'vector', 10)
+with al.scope(core_mode="vector"):
+    tl.sync_block_wait('cube', 'vector', 10)
 scoreboard_release_tile_flat(
     scoreboard_ptr=scoreboard_ptr,
     layer_id=layer_id,
@@ -156,10 +158,10 @@ linear_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES}, ALIGNMENT_K={ALIGNMENT_K})
 """
     else:
-        code = _make_npu_linear_inline_code(
+        code = _make_npu_linear_task_inline_code(
             BLOCK_SIZE_M=config.BLOCK_SIZE_M, BLOCK_SIZE_N=config.BLOCK_SIZE_N,
             SUB_BLOCK_SIZE_N=config.SUB_BLOCK_SIZE_N, BLOCK_SIZE_K=config.BLOCK_SIZE_K,
-            NUM_STAGES=config.NUM_STAGES)
+            NUM_STAGES=config.NUM_STAGES, ALIGNMENT_K=ALIGNMENT_K)
     return code
 
 
@@ -171,7 +173,7 @@ fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
 """
     else:
-        code = _make_npu_linear_inline_code(
+        code = _make_npu_fc1_inline_code(
             BLOCK_SIZE_M=config.BLOCK_SIZE_M, BLOCK_SIZE_N=config.BLOCK_SIZE_N,
             SUB_BLOCK_SIZE_N=config.SUB_BLOCK_SIZE_N, BLOCK_SIZE_K=config.BLOCK_SIZE_K,
             NUM_STAGES=config.NUM_STAGES)
@@ -186,7 +188,7 @@ fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
 """
     else:
-        code = _make_npu_linear_inline_code(
+        code = _make_npu_fc1_inline_code(
             BLOCK_SIZE_M=config.BLOCK_SIZE_M, BLOCK_SIZE_N=config.BLOCK_SIZE_N,
             SUB_BLOCK_SIZE_N=config.SUB_BLOCK_SIZE_N, BLOCK_SIZE_K=config.BLOCK_SIZE_K,
             NUM_STAGES=config.NUM_STAGES)
@@ -201,7 +203,7 @@ fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
 """
     else:
-        code = _make_npu_linear_inline_code(
+        code = _make_npu_fc1_inline_code(
             BLOCK_SIZE_M=config.BLOCK_SIZE_M, BLOCK_SIZE_N=config.BLOCK_SIZE_N,
             SUB_BLOCK_SIZE_N=config.SUB_BLOCK_SIZE_N, BLOCK_SIZE_K=config.BLOCK_SIZE_K,
             NUM_STAGES=config.NUM_STAGES)
@@ -216,7 +218,7 @@ fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
 """
     else:
-        code = _make_npu_linear_inline_code(
+        code = _make_npu_fc1_inline_code(
             BLOCK_SIZE_M=config.BLOCK_SIZE_M, BLOCK_SIZE_N=config.BLOCK_SIZE_N,
             SUB_BLOCK_SIZE_N=config.SUB_BLOCK_SIZE_N, BLOCK_SIZE_K=config.BLOCK_SIZE_K,
             NUM_STAGES=config.NUM_STAGES)
