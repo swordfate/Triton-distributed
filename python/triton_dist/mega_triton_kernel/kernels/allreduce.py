@@ -1,15 +1,12 @@
 import triton
 import triton.language as tl
-# from triton.language.extra.cuda.language_extra import tid, __syncthreads
-# from .task_context import TaskBaseInfo, Scoreboard
-# from triton.language.extra.cuda.language_extra import (st_v4_b32, multimem_ld_reduce_v4)
-# from triton.language.extra.cuda.utils import num_warps
 from torch_npu.contrib import transfer_to_npu
 from .task_context_utils import *
 
 import triton_dist.language as dl
 from triton_dist.language.extra import libshmem_device
 from triton.language.extra.cann.extension import sub_vec_id
+from triton.language.extra.cann import extension as al
 
 @triton.jit
 def gemm_swizzle2d_Nz(
@@ -57,143 +54,142 @@ def allreduce_task_compute(
 
     B_dim = tensor_desc_size(c_tensor, 0)
     H_dim = tensor_desc_size(c_tensor, 1, 16)
-    
+
     peer_mem_ptr = tensor_desc_data_ptr(peer_mem_tensor, tl.bfloat16)
     barrier_intra_ptr = tensor_desc_data_ptr(barrier_intra_tensor, tl.int64)
     barrier_ptr  = tensor_desc_data_ptr(barrier_tensor, tl.int64)
     c_ptr        = tensor_desc_data_ptr(c_tensor, tl.bfloat16)
-    
+
     rank = tl.load(extra_params).to(tl.int32)
     rank_size = tl.load(extra_params + 1).to(tl.int32)
     stride_cb = H_dim
     stride_ch = 1
 
-    # allreduce_tile_compute(
-    #     tile_id=tile_id_or_start,
-    #     c_ptr=c_ptr, peer_mem_ptr=peer_mem_ptr, rank=rank, rank_size=rank_size,
-    #     barrier_intra_node_ptr=barrier_intra_ptr, barrier_ptr=barrier_ptr,
-    #     B_dim=B_dim, H_dim=H_dim,
-    #     stride_cb=stride_cb, stride_ch=stride_ch,
-    #     BLOCK_SIZE_B=BLOCK_SIZE_B, BLOCK_SIZE_H=BLOCK_SIZE_H
-    # )
-    tile_id = tile_id_or_start
+    localAicoreIndex = tl.program_id(axis=0) # SM id in megakernel
+    ncore = tl.num_programs(axis=0)           # NUM_SMS in megakernel
     barrier_intra_node_ptr = barrier_intra_ptr
-    
-    
-    aivIndex = sub_vec_id() 
-    ncore = tl.num_programs(axis=0) # 总的 AICore 数量
 
     problemSize_in_rank_b = (B_dim + rank_size - 1) // rank_size
     bLoops = tl.cdiv(problemSize_in_rank_b, BLOCK_SIZE_B)
     hLoops = tl.cdiv(H_dim, BLOCK_SIZE_H)
 
-    # 所有的通信与显存读写操作放置在 aivIndex == 0 中执行
-    if aivIndex == 0:
-        # =========================================================================
+    rs_buffer_ptr = peer_mem_ptr + B_dim * H_dim
+    total_rs_blocks_spatial = bLoops * hLoops
+    total_rs_blocks = total_rs_blocks_spatial * rank_size
+
+    # =========================================================================
+    # Dual-AIV: al.parallel distributes work across AIV 0 and AIV 1
+    # =========================================================================
+    for sub_id in al.parallel(0, 2, bind_sub_block=True):
+        # =====================================================================
         # PRE-PHASE: Notify Peers Input is Ready
-        # =========================================================================
-        barrier_addr = barrier_ptr + (0 * rank_size + rank) * 8
-        for r in range(tile_id, rank_size, ncore):
-            dl.notify(barrier_addr, r, signal=1, sig_op="set", comm_scope="intra_node")
+        # =====================================================================
+        for r in range(localAicoreIndex, rank_size, ncore):
+            target_barrier_addr = barrier_ptr + (sub_id * rank_size + rank) * 8
+            dl.notify(target_barrier_addr, r, signal=1, sig_op="set", comm_scope="intra_node")
 
-        rs_buffer_ptr = peer_mem_ptr + B_dim * H_dim
-        
-        # =========================================================================
+        barrier_addr = barrier_ptr + sub_id * rank_size * 8
+        rs_token = dl.wait(barrier_addr, rank_size, scope="gpu", semantic="acquire", waitValue=1)
+
+        # =====================================================================
         # PHASE 1: Reduce-Scatter (寄存器内循环累加)
-        # =========================================================================
-        total_rs_blocks_spatial = bLoops * hLoops
-
-        barrier_addr = barrier_ptr + (0 * rank_size) * 8
-        rs_token = dl.wait(barrier_addr, rank_size, scope="gpu", _semantic="acquire", waitValue=1)
-
-        for idx in range(tile_id, total_rs_blocks_spatial, ncore):
+        # =====================================================================
+        for idx in range(localAicoreIndex * 2 + sub_id, total_rs_blocks_spatial, ncore * 2):
             b_id_in_comm, h_id_in_comm = gemm_swizzle2d_Nz(
                 idx, bLoops * BLOCK_SIZE_B, H_dim, BLOCK_SIZE_B, BLOCK_SIZE_H
             )
-            
+
             offs_cb = (
-                rank * problemSize_in_rank_b 
+                rank * problemSize_in_rank_b
                 + b_id_in_comm * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
             )
             offs_ch = h_id_in_comm * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
-            
+
             mask_b = (offs_cb < (rank + 1) * problemSize_in_rank_b) & (offs_cb < B_dim)
             mask_h = offs_ch < H_dim
             mask = mask_b[:, None] & mask_h[None, :]
 
-            # 在高速寄存器中累加
             acc = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
             for target_rank in range(rank_size):
                 remote_ptr = dl.symm_at(peer_mem_ptr, target_rank)
-                remote_ptr = dl.consume_token(remote_ptr, rs_token) 
+                remote_ptr = dl.consume_token(remote_ptr, rs_token)
                 remote_ptrs = remote_ptr + offs_cb[:, None] * H_dim + offs_ch[None, :]
                 c_temp = tl.load(remote_ptrs, mask=mask, other=0.0)
                 acc += c_temp
-            
+
             acc = acc.to(tl.bfloat16)
-            # 写入 rs_buffer
+
             offs_cb_relative = b_id_in_comm * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
             rs_offs = offs_cb_relative[:, None] * H_dim + offs_ch[None, :]
             local_rs_ptrs = rs_buffer_ptr + rs_offs
-            acc = acc.to(tl.bfloat16)
             tl.store(local_rs_ptrs, acc, mask=mask)
-            
-            # 写入 C 矩阵
+
             c_offs = stride_cb * offs_cb[:, None] + stride_ch * offs_ch[None, :]
             c_dst_ptrs = c_ptr + c_offs
             tl.store(c_dst_ptrs, acc, mask=mask)
 
-        barrier_intra_node_addr = barrier_intra_node_ptr + tile_id * 8
+        # =====================================================================
+        # Intra-node sync (doubled: 2 slots per core, 2*ncore signals)
+        # =====================================================================
+        barrier_intra_node_addr = barrier_intra_node_ptr + (localAicoreIndex * 2) * 8
         dl.notify(barrier_intra_node_addr, rank, signal=1, sig_op="set", comm_scope="intra_node")
-        intrasync_token = dl.wait(barrier_intra_node_ptr, ncore, scope="gpu", _semantic="acquire", waitValue=1)
-        
-        # 当前 rank 内部计算完成，通知目标 rank
-        for r in range(tile_id, rank_size, ncore):
-            barrier_addr = barrier_ptr + (1 * rank_size + rank) * 8
+        dl.notify(barrier_intra_node_addr + 8, rank, signal=1, sig_op="set", comm_scope="intra_node")
+        intrasync_token = dl.wait(
+            barrier_intra_node_ptr + (localAicoreIndex * 2 + sub_id) * 8,
+            ncore * 2, scope="gpu", semantic="acquire", waitValue=1
+        )
+
+        # =====================================================================
+        # Phase 2: Notify
+        # =====================================================================
+        for r in range(localAicoreIndex, rank_size, ncore):
+            barrier_addr = barrier_ptr + ((2 + sub_id) * rank_size + rank) * 8
             dl.notify(barrier_addr, r, signal=1, sig_op="set", comm_scope="intra_node")
 
-        total_rs_blocks = bLoops * hLoops * rank_size
-        # 等待所有 rank 的 Phase 1 结束
-        wait_addr = barrier_ptr + (1 * rank_size) * 8
-        p1_done_token = dl.wait(wait_addr, rank_size, scope="gpu", _semantic="acquire", waitValue=1)
+        barrier_addr = barrier_ptr + ((2 + sub_id) * rank_size) * 8
+        p1_done_token = dl.wait(barrier_addr, rank_size, scope="gpu", semantic="acquire", waitValue=1)
 
-        # =========================================================================
+        # =====================================================================
         # PHASE 2: All-Gather (直接拉取远程 RS Buffers)
-        # =========================================================================
-        for block_id in range(tile_id, total_rs_blocks, ncore):
+        # =====================================================================
+        for block_id in range(localAicoreIndex * 2 + sub_id, total_rs_blocks, ncore * 2):
             swizzle_b, swizzle_h = gemm_swizzle2d_Nz(
                 block_id, rank_size * BLOCK_SIZE_B * bLoops, H_dim, BLOCK_SIZE_B, BLOCK_SIZE_H
             )
             src_rank_idx = swizzle_b // bLoops
-            b_id_in_comm = swizzle_b % bLoops 
-            
+            b_id_in_comm = swizzle_b % bLoops
+
             if src_rank_idx != rank:
                 remote_peer_ptr = dl.symm_at(peer_mem_ptr, src_rank_idx)
                 ready_base_ptr = dl.consume_token(remote_peer_ptr, intrasync_token)
                 ready_base_ptr = dl.consume_token(ready_base_ptr, p1_done_token)
-                
+
                 rs_buffer_offset = B_dim * H_dim
                 offs_b_relative = b_id_in_comm * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
                 offs_h = swizzle_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
                 rs_offs = offs_b_relative[:, None] * H_dim + offs_h[None, :]
-                
+
                 remote_rs_ptrs = ready_base_ptr + rs_buffer_offset + rs_offs
-                
-                offs_b_absolute = (src_rank_idx * problemSize_in_rank_b 
+
+                offs_b_absolute = (src_rank_idx * problemSize_in_rank_b
                                 + b_id_in_comm * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B))
                 mask_b = (offs_b_absolute < (src_rank_idx + 1) * problemSize_in_rank_b) & (offs_b_absolute < B_dim)
                 mask_h = offs_h < H_dim
                 mask = mask_b[:, None] & mask_h[None, :]
-                
+
                 gathered_val = tl.load(remote_rs_ptrs, mask=mask, other=0.0)
-                
+
                 c_offs = stride_cb * offs_b_absolute[:, None] + stride_ch * offs_h[None, :]
                 c_dst_ptrs = c_ptr + c_offs
                 tl.store(c_dst_ptrs, gathered_val, mask=mask)
 
+    # =========================================================================
+    # After al.parallel: single scoreboard release (AIV 0 only)
+    # =========================================================================
+    if sub_vec_id() == 0:
         scoreboard_release_tile_flat(
-            scoreboard_ptr, 
-            layer_id=layer_id, 
+            scoreboard_ptr,
+            layer_id=layer_id,
             task_id=task_id,
             tile_id=tile_id_or_start,
             TILE_READY_SIGNAL=TILE_READY_SIGNAL,

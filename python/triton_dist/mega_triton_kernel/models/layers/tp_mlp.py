@@ -65,8 +65,8 @@ class TPMLPBuilder:
             )
         
         if self.world_size > 1:
-            self.barrier_tensor = ash.aclshmem_create_tensor([self.world_size * 8 * 2], dtype=torch.int64, device_id=self.rank)
-            self.barrier_intra_node = ash.aclshmem_create_tensor([self._builder.NUM_SMS * 8], dtype=torch.int64, device_id=self.rank)
+            self.barrier_tensor = ash.aclshmem_create_tensor([self.world_size * 4 * 8], dtype=torch.int64, device_id=self.rank)
+            self.barrier_intra_node = ash.aclshmem_create_tensor([self._builder.NUM_SMS * 2 * 8], dtype=torch.int64, device_id=self.rank)
             self.barrier_tensor.zero_()
             self.barrier_intra_node.zero_()
 
